@@ -2,7 +2,7 @@
 
 [English](COMPATIBILITY.md) | **简体中文**
 
-实现所依赖的实测运行时事实，以及已知限制。验证于 `langchain 1.4.1`、`langchain-core 1.6.4`、`deepagents 0.7.15`（Python）、LangGraph 内存检查点（`MemorySaver`）、Python 3.11–3.12。
+实现所依赖的实测运行时事实，以及已知限制。验证于 `langchain 1.4.1`、`langchain-core 1.6.4`、`deepagents 0.7.15`（Python）、LangGraph 内存检查点（`MemorySaver`）、Python 3.11–3.12；真模型冒烟另经 `langchain 1.4.5` / `deepagents 0.7.24` / `langchain-openai 1.7.1`（OpenAI 兼容网关后的 GLM 推理模型）验证。
 
 ## 会话身份来源
 
@@ -13,6 +13,8 @@
 ## 头透传链（实测）
 
 `wrap_model_call` → `ModelRequest.model_settings` → `model.bind(**model_settings)` / `bind_tools(..., **model_settings)`（`langchain.agents` 工厂）→ ChatOpenAI 请求 → OpenAI SDK `create(extra_headers=…)`。因此 `X-Agent-Hint` 头在 OpenAI 兼容适配器上到达 wire；fake 模型只是忽略多余的 bind kwargs（keyless 路径不受影响）。
+
+该通道是 SDK 级的，与 API 形态无关：langchain-openai 1.7.x 对部分模型会改走 OpenAI **Responses API**（`POST /v1/responses`）而非 chat completions——已对真实 OpenAI 兼容网关端到端验证：hint 头在两条路径上均到达并被上游接受（HTTP 200）。
 
 ## 钩子时序（实测）
 

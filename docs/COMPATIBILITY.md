@@ -3,8 +3,11 @@
 **English** | [简体中文](COMPATIBILITY.zh-CN.md)
 
 Measured runtime facts the implementation relies on, plus known limitations.
-Verified against `langchain 1.4.1`, `langchain-core 1.6.4`, `deepagents 0.7.15`
-(Python), LangGraph memory checkpointing (`MemorySaver`), Python 3.11–3.12.
+Verified against `langchain 1.4.1` / `langchain-core 1.6.4` / `deepagents 0.7.15`
+(Python), LangGraph memory checkpointing (`MemorySaver`), Python 3.11–3.12;
+real-endpoint smoke additionally verified against `langchain 1.4.5` /
+`deepagents 0.7.24` / `langchain-openai 1.7.1` with a GLM reasoning model
+behind an OpenAI-compatible gateway.
 
 ## Session identity sources
 
@@ -23,6 +26,12 @@ Verified against `langchain 1.4.1`, `langchain-core 1.6.4`, `deepagents 0.7.15`
 `create(extra_headers=…)`. The `X-Agent-Hint` header therefore reaches the
 wire on OpenAI-compatible adapters; fake models simply ignore the extra bind
 kwargs (keyless paths are unaffected).
+
+The channel is SDK-level and API-shape-agnostic: with langchain-openai 1.7.x
+the request may go through the OpenAI **Responses API** (`POST /v1/responses`)
+instead of chat completions — verified end-to-end against a real
+OpenAI-compatible gateway that the header rides both paths and is accepted
+(HTTP 200) by the upstream.
 
 ## Hook timing (measured)
 

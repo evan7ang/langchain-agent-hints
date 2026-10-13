@@ -93,7 +93,9 @@ agent = create_deep_agent(
 )
 ```
 
-可运行版本见 [`examples/deepagents_quickstart.py`](examples/deepagents_quickstart.py)。
+可运行版本见 [`examples/deepagents_quickstart.py`](examples/deepagents_quickstart.py)——
+支持 `AGENT_HINTS_EXAMPLE_MODEL`（覆盖模型字符串）与 `AGENT_HINTS_STATUS_SINK`（事件落盘路径），
+经 `OPENAI_BASE_URL` 可对接任意 OpenAI 兼容网关。
 
 ## 发送什么
 

@@ -115,7 +115,10 @@ agent = create_deep_agent(
 )
 ```
 
-A runnable version lives in [`examples/deepagents_quickstart.py`](examples/deepagents_quickstart.py).
+A runnable version lives in [`examples/deepagents_quickstart.py`](examples/deepagents_quickstart.py) —
+it accepts `AGENT_HINTS_EXAMPLE_MODEL` (model string override) and
+`AGENT_HINTS_STATUS_SINK` (event file), and works against any OpenAI-compatible
+gateway via `OPENAI_BASE_URL`.
 
 ## What gets sent
 

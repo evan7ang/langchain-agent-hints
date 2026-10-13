@@ -5,16 +5,19 @@ Requirements (not declared by the package itself):
     pip install deepagents langchain-openai
     export OPENAI_API_KEY=...   # any tool-calling model works
 
+Any OpenAI-compatible gateway works too: point ``OPENAI_BASE_URL`` at it and
+override the model string with ``AGENT_HINTS_EXAMPLE_MODEL`` (default
+``openai:gpt-4o-mini``). Status events land in ``AGENT_HINTS_STATUS_SINK`` if
+set, else ``examples/status-events.jsonl``.
+
 Run from the repository root:
 
     python examples/deepagents_quickstart.py
-
-The run writes out-of-band status events to ``examples/status-events.jsonl``
-(next to this file) and carries one X-Agent-Hint header per model request.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from deepagents import create_deep_agent
@@ -27,10 +30,13 @@ from langchain_agent_hints import (
 
 
 def main() -> None:
-    sink_path = Path(__file__).parent / "status-events.jsonl"
+    model = os.environ.get("AGENT_HINTS_EXAMPLE_MODEL", "openai:gpt-4o-mini")
+    sink_path = Path(
+        os.environ.get("AGENT_HINTS_STATUS_SINK") or (Path(__file__).parent / "status-events.jsonl")
+    )
 
     agent = create_deep_agent(
-        model="openai:gpt-4o-mini",
+        model=model,
         tools=[],
         middleware=[
             AgentHintsMiddleware(agent_type="quickstart-agent"),
