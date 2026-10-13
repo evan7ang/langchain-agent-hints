@@ -1,5 +1,7 @@
 # Agent Hint protocol — wire specification
 
+**English** | [简体中文](PROTOCOL.zh-CN.md)
+
 This document specifies the Agent Hint wire contract implemented by
 `langchain-agent-hints`. Section references (`§N`) in the code and tests point
 here.

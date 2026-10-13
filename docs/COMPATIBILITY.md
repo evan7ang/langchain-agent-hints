@@ -1,5 +1,7 @@
 # Compatibility notes
 
+**English** | [简体中文](COMPATIBILITY.zh-CN.md)
+
 Measured runtime facts the implementation relies on, plus known limitations.
 Verified against `langchain 1.4.1`, `langchain-core 1.6.4`, `deepagents 0.7.15`
 (Python), LangGraph memory checkpointing (`MemorySaver`), Python 3.11–3.12.
