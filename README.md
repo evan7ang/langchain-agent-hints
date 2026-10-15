@@ -3,6 +3,7 @@
 **English** | [简体中文](README.zh-CN.md)
 
 [![CI](https://github.com/evan7ang/langchain-agent-hints/actions/workflows/ci.yml/badge.svg)](https://github.com/evan7ang/langchain-agent-hints/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/langchain-agent-hints)](https://pypi.org/project/langchain-agent-hints/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)
 
@@ -49,11 +50,10 @@ foreground-blocking).
 
 ```bash
 pip install langchain-agent-hints
-# not yet on PyPI — install from git until then:
-pip install git+https://github.com/evan7ang/langchain-agent-hints.git
 ```
 
-Requires Python ≥ 3.11 and `langchain>=1.4,<2.0`.
+Requires Python ≥ 3.11 and `langchain>=1.4,<2.0`. Source install also works:
+`pip install git+https://github.com/evan7ang/langchain-agent-hints.git`.
 
 ## Quickstart
 

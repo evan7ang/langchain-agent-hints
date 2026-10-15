@@ -3,6 +3,7 @@
 [English](README.md) | **简体中文**
 
 [![CI](https://github.com/evan7ang/langchain-agent-hints/actions/workflows/ci.yml/badge.svg)](https://github.com/evan7ang/langchain-agent-hints/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/langchain-agent-hints)](https://pypi.org/project/langchain-agent-hints/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)
 
@@ -27,11 +28,10 @@
 
 ```bash
 pip install langchain-agent-hints
-# 尚未发布 PyPI——在此之前可从 git 安装：
-pip install git+https://github.com/evan7ang/langchain-agent-hints.git
 ```
 
-要求 Python ≥ 3.11、`langchain>=1.4,<2.0`。
+要求 Python ≥ 3.11、`langchain>=1.4,<2.0`。源码安装也可用：
+`pip install git+https://github.com/evan7ang/langchain-agent-hints.git`。
 
 ## 快速开始
 
