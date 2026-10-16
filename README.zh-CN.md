@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/evan7ang/langchain-agent-hints/actions/workflows/ci.yml/badge.svg)](https://github.com/evan7ang/langchain-agent-hints/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/langchain-agent-hints)](https://pypi.org/project/langchain-agent-hints/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MulanPSL2](https://img.shields.io/badge/License-MulanPSL2-blue.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)
 
 **面向 LangChain Agent 的按请求服务意图提示，以中间件形式提供。**
@@ -179,4 +179,4 @@ CI 在 Python 3.11–3.13 上运行同一套检查。
 
 ## 许可证
 
-[MIT](LICENSE)
+[木兰宽松许可证，第2版 (Mulan PSL v2)](LICENSE)

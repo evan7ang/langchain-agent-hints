@@ -7,7 +7,7 @@ name = "langchain-agent-hints"
 dynamic = ["version"]
 description = "Per-request serving-intent hints (X-Agent-Hint) and out-of-band agent status events, as LangChain agent middleware."
 readme = "README.md"
-license = "MIT"
+license = "MulanPSL-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [{ name = "evan7ang" }]

@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/evan7ang/langchain-agent-hints/actions/workflows/ci.yml/badge.svg)](https://github.com/evan7ang/langchain-agent-hints/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/langchain-agent-hints)](https://pypi.org/project/langchain-agent-hints/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MulanPSL2](https://img.shields.io/badge/License-MulanPSL2-blue.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)
 
 **Per-request serving-intent hints for LangChain agents, as middleware.**
@@ -213,4 +213,4 @@ CI runs the same suite on Python 3.11–3.13.
 
 ## License
 
-[MIT](LICENSE)
+[Mulan Permissive Software License, Version 2 (Mulan PSL v2)](LICENSE)
