@@ -5,12 +5,14 @@ schema, the pure ``build_agent_hint`` constructor, and the base64url
 ``X-Agent-Hint`` header codec. Stdlib only, no harness imports, so the wire
 shape is testable without langchain.
 
-v1 emission boundaries (docs/PROTOCOL.md §6):
+Emission boundaries (docs/PROTOCOL.md §6):
 
-- ``prediction`` is defined (it is part of the protocol) but never emitted —
-  it requires an observation-statistics engine;
-- ``strict_priority`` is never emitted — the field definition reserves it for
-  a trusted control plane;
+- ``prediction`` is emitted when the caller supplies one (the observation
+  engine in :mod:`langchain_agent_hints.observation` produces measured
+  estimates); partial objects are valid — omission is the encoding for
+  "no estimate".
+- ``strict_priority`` is never derived from agent facts; it is only emitted
+  when a trusted control plane injects it explicitly.
 - ``derivation.fork_point`` is defined but never emitted (needs a message
   index contract).
 """
@@ -117,6 +119,41 @@ DEFAULT_CACHE_CONTROL: tuple[CacheControlHint, ...] = (
     CacheControlHint(type="pin", range=CacheControlRange(end=1)),
 )
 
+#: The contracted priority domain (v2): ``3`` = user-intervened
+#: (admission-exempt), ``1`` = everything else. The values are contract
+#: anchors against the inference-side admission line, not tiers.
+PRIORITY_LEVELS: tuple[int, ...] = (1, 3)
+
+
+def normalize_priority_level(level: int) -> int:
+    """Fold a priority level into the two-value domain ``{1, 3}``.
+
+    Cross-harness contract: the Motor admission line is ``3``. v1 legacy
+    ``{2, 4}`` map to the nearest value; any other integer folds by the
+    admission line (``>= 3 -> 3``, else ``-> 1``) — admission outcomes are
+    unchanged. Non-integers are returned untouched so a caller bug surfaces
+    instead of being silently rewritten.
+    """
+    if not isinstance(level, int) or isinstance(level, bool):
+        return level
+    if level in PRIORITY_LEVELS:
+        return level
+    if level == 2:
+        return 1
+    if level == 4:
+        return 3
+    return 3 if level >= 3 else 1
+
+
+def _fold_priority(priority: PriorityHint | None) -> PriorityHint | None:
+    """Return the priority with its level folded into the contracted domain."""
+    if priority is None:
+        return None
+    level = normalize_priority_level(priority.level)
+    if level == priority.level:
+        return priority
+    return PriorityHint(level=level, reason=priority.reason)
+
 
 @dataclass(frozen=True)
 class PredictedTool:
@@ -210,6 +247,9 @@ def build_agent_hint(
     facts: HintRequestFacts,
     options: HintOptions,
     now_ms: int,
+    *,
+    prediction: PredictionHint | None = None,
+    strict_priority: PriorityHint | None = None,
 ) -> AgentHint:
     """Build one AgentHint for a main-line model request.
 
@@ -223,6 +263,12 @@ def build_agent_hint(
     subagents (e.g. deepagents ``task``) are blocking, so children report
     ``join="sync"`` explicitly (the protocol default is sync; making it
     explicit costs nothing and pins the semantics).
+
+    ``prediction`` is the serving-side estimate block (measured by the
+    observation engine or supplied by the caller); ``strict_priority`` is
+    control-plane injected only. Both are omitted from the wire when ``None``.
+    Priority levels are folded into the contracted ``{1, 3}`` domain here so
+    every emission path shares one normalization point.
     """
     has_parent = facts.parent_session_id is not None
     derivation = (
@@ -246,8 +292,10 @@ def build_agent_hint(
             state="running",
             state_since_ms=facts.state_since_ms if facts.state_since_ms is not None else now_ms,
         ),
-        priority=options.priority,
+        priority=_fold_priority(options.priority),
+        strict_priority=_fold_priority(strict_priority),
         cache_control=options.cache_control,
+        prediction=prediction,
     )
 
 

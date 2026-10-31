@@ -39,6 +39,7 @@ def _assert_hint_shape(record: dict[str, Any], *, thread_id: str, agent_type: st
     assert hint["agent_status"]["state"] == "running"
     assert hint["priority"] == {"level": 3, "reason": "user_waiting"}
     assert hint["cache_control"] == [{"type": "pin", "range": {"end": 1}}]
+    # A single call has no observations yet: the measured block is omitted.
     assert "prediction" not in hint and "strict_priority" not in hint
 
     # Header-only channel: the hint never leaks into the request body.

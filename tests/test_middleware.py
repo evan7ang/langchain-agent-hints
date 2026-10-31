@@ -83,6 +83,7 @@ def test_two_calls_hinted_with_state_derived_call_index(tmp_path: Path) -> None:
     assert first["agent_status"]["state"] == "running"
     assert first["priority"] == {"level": 3, "reason": "user_waiting"}
     assert first["cache_control"] == [{"type": "pin", "range": {"end": 1}}]
+    # Below the observation min_samples threshold the measured block is omitted.
     assert "prediction" not in first and "strict_priority" not in first
     assert "parent_session_id" not in first["session"]
     assert "derivation" not in first["session"]

@@ -16,6 +16,7 @@ from langchain_agent_hints.middleware import (
     SessionIdentity,
     resolve_session_identity,
 )
+from langchain_agent_hints.observation import ObservationOptions, ObservationStore
 from langchain_agent_hints.schema import (
     DEFAULT_CACHE_CONTROL,
     DEFAULT_PRIORITY,
@@ -28,6 +29,8 @@ from langchain_agent_hints.schema import (
     DerivationHint,
     HintOptions,
     HintRequestFacts,
+    NextActionHint,
+    PredictedTool,
     PredictionHint,
     PriorityHint,
     SessionHint,
@@ -36,15 +39,17 @@ from langchain_agent_hints.schema import (
     decode_agent_hint,
     encode_agent_hint,
     hint_to_dict,
+    normalize_priority_level,
 )
 from langchain_agent_hints.status import (
     AgentStatusEventsMiddleware,
+    HttpStatusEventSink,
     JsonlStatusEventSink,
     StatusEventSink,
     status_event,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "HINT_HEADER",
@@ -61,7 +66,12 @@ __all__ = [
     "DerivationHint",
     "HintOptions",
     "HintRequestFacts",
+    "HttpStatusEventSink",
     "JsonlStatusEventSink",
+    "NextActionHint",
+    "ObservationOptions",
+    "ObservationStore",
+    "PredictedTool",
     "PredictionHint",
     "PriorityHint",
     "SessionHint",
@@ -72,6 +82,7 @@ __all__ = [
     "decode_agent_hint",
     "encode_agent_hint",
     "hint_to_dict",
+    "normalize_priority_level",
     "resolve_session_identity",
     "status_event",
 ]

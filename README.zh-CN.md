@@ -105,7 +105,8 @@ agent = create_deep_agent(
 | `agent_status` | 请求时刻的生命周期快照（恒为 `running`） | 中间件观测 |
 | `priority` | 级别 + 审计原因（默认 `{level: 3, reason: user_waiting}`；子代理为 `critical_path`） | 构造参数 |
 | `cache_control` | 消息区间的 pin/ephemeral 缓存意图（默认：pin 系统提示词 `[0, 1)`） | 构造参数 |
-| `prediction`、`strict_priority` | 协议已定义，v1 **永不发送** | — |
+| `prediction` | 实测服务预估：`latency_ms`、`output_tokens`、`interval_ms`、`remaining_calls`、`remaining_time_ms`、`next_action` | 插件内观测引擎（滚动 p90）；样本不足时省略 |
+| `strict_priority` | 保留给可信控制面 | 仅构造参数显式注入；普通 Agent 永不生成 |
 
 完整 wire 契约：[`docs/PROTOCOL.md`](docs/PROTOCOL.md)（[中文版](docs/PROTOCOL.zh-CN.md)）。
 
@@ -130,7 +131,11 @@ agent = create_deep_agent(
 | `wrap_tool_call` 退出 | `running` | 仅当会话最后一个在途工具结束 |
 | `after_agent` | `finalize` | 仅在真正完成时触发（审批挂起不触发 finalize） |
 
-传入 `interrupt_tools=INTERRUPT_ON.keys()`（人工审批门控的工具名），被门控的工具调用就会以 `pause` 事件呈现。sink 实现单方法 `StatusEventSink` 协议；`JsonlStatusEventSink` 落盘 JSONL 文件（按会话序列号排序、瞬时失败重试）。sink 接口是同步的——异步钩子内联调用它，慢传输请使用带缓冲的 sink。
+传入 `interrupt_tools=INTERRUPT_ON.keys()`（人工审批门控的工具名），被门控的工具调用就会以 `pause` 事件呈现。`subagent_tools={"task"}`（默认）把委派调用上报为 `tool` + `reason="join_barrier"`，带子 Agent 名（`agent:<type>`）与 `child_session_id`；`suspend_after_s=N` 在审批挂起超时后上报 `suspend`（`checkpoint`）；`expected_resume_s=N` 把等待估计挂到 pause 事件的 `prediction`。sink 实现单方法 `StatusEventSink` 协议；`JsonlStatusEventSink` 落盘 JSONL，`HttpStatusEventSink` POST 到网关端点（均按会话序列号排序、瞬时失败重试后丢弃）。sink 接口是同步的——异步钩子内联调用它，慢传输请使用带缓冲的 sink。
+
+## 服务预估（`prediction`）
+
+与 Dify 不同（平台边界迫使使用带外 hint service），LangChain 的钩子可直接观测。插件内观测引擎按 agent_type 维护有界滚动窗口：模型调用延迟与输出 token（`usage_metadata`）、调用间隔、每会话调用数与会话时长、工具耗时、模型→tool / finalize 转换。构建 hint 时每指标取单值（最近秩分位，默认 p90）发出部分 `prediction`；样本不足 `min_samples`（默认 3）的指标省略。构造参数中的静态 `prediction` 按字段覆盖实测值；`ObservationOptions(enabled=False)` 可关闭，`persist_path` 可跨重启携带聚合。
 
 ## 禁用
 
@@ -175,7 +180,7 @@ CI 在 Python 3.11–3.13 上运行同一套检查。
 
 - 发布 PyPI，并进入 LangChain middleware 集成列表。
 - 异步友好（带缓冲/异步）的 sink 接口。
-- `prediction` 块：基于观测统计的服务端预估。
+- 跨进程/跨副本的观测聚合（当前引擎为进程内；`persist_path` 可跨重启携带聚合）。
 
 ## 许可证
 

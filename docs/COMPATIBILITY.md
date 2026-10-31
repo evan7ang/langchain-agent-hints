@@ -49,6 +49,23 @@ OpenAI-compatible gateway that the header rides both paths and is accepted
 - Gated tools never reach `wrap_tool_call` while paused (no spurious `tool`
   event) and reach it after approval — the natural resume signal.
 
+## In-plugin observation (measured)
+
+- `wrap_model_call` sees the handler result's `AIMessage.usage_metadata`
+  (`input_tokens` / `output_tokens` / `total_tokens`) with `langchain-core`
+  1.6.x and `langchain-openai` 1.6.x; models that omit usage metadata simply
+  contribute no `output_tokens` samples.
+- Latency is measured around the handler (queueing included);
+  `wrap_tool_call` measures tool duration the same way.
+- The interval sample is the gap between the previous call's end and this
+  call's start (state-derived, no counter to lose).
+- `remaining_calls` / `remaining_time_ms` are derived from completed sessions
+  of the same `agent_type`; they are estimates, not orchestrator knowledge.
+- `next_action` is learned from model→tool vs model→finalize transitions
+  (majority vote, with the most common next tool); a cold process emits none.
+- Aggregates are thread-safe and bounded (`max_samples`, default 256); the
+  `persist_path` JSON carries them across process restarts.
+
 ## Known limitations (v1)
 
 - **Same-name concurrent subagents collide** on the session id
