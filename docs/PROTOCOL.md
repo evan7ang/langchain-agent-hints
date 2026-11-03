@@ -85,9 +85,13 @@ applicable"** (e.g. root sessions carry no `parent_session_id`).
 interactive work waiting on the user (`user_waiting`); sync-joined children
 sit on the parent's critical path (`critical_path`).
 
-- `priority` — the agent's own serving priority.
+- `priority` — the agent's own serving priority. Levels are folded into the
+  contracted two-value domain `{1, 3}` at the protocol layer (`3` =
+  user-intervened / admission-exempt, `1` = everything else; legacy `{2, 4}`
+  and out-of-range values fold without changing admission outcomes).
 - `strict_priority` — **reserved for a trusted control plane; ordinary agents
-  never emit it.**
+  never emit it.** It is only serialized when the composition injects it
+  explicitly (constructor argument), never derived from agent facts.
 
 ### 3.5 `cache_control`
 
@@ -97,13 +101,17 @@ cache intent over message ranges. The library default pins the system prompt
 (range `[0, 1)`) — a declaration of the byte-stable-prefix guarantee a
 composition already makes.
 
-### 3.6 `prediction` (v1: never emitted)
+### 3.6 `prediction` (measured in-process)
 
 Serving-side estimates: `latency_ms`, `remaining_calls`, `output_tokens`,
 `interval_ms`, `remaining_time_ms`, `expected_resume_s`,
 `next_action: {state, tools?: [{name, expected_duration_s?}], prob?}`.
-Defined for forward compatibility; filling it requires an
-observation-statistics engine.
+
+The library fills this block from an in-plugin observation engine (rolling
+per-agent-type statistics, one value per metric — nearest-rank quantile,
+default p90). The object is partial by design: a metric is omitted until it has
+enough samples, and omission is the encoding for "no estimate". Static
+per-field overrides supplied to the middleware win over measured values.
 
 ## 4. Emission rules (in-band)
 
@@ -133,7 +141,12 @@ Transition rules:
 | `pause` (`reason: human_approval`) | A model response contains a tool call gated for human approval, just before the suspension begins. |
 | `tool` (`reason: await_tool`) | A tool call begins; `tools` lists `{name, call_id}`. |
 | `running` (from `tool`) | The session's **last** outstanding tool completes (parallel tool batches report running only after the last result). |
+| `tool` (`reason: join_barrier`) | A delegation tool (deepagents `task`) starts; `tools` names the child (`agent:<type>`) and carries `child_session_id`. The parent blocks until the child returns. |
+| `suspend` (`reason: checkpoint`) | An approval pause outlives the configured `suspend_after_s` threshold (optional; off by default). |
 | `finalize` | The graph run actually completes. An approval pause suspends mid-run without finalize; the resumed run finalizes exactly once. |
+
+A `pause` event may carry an estimate block: `"prediction":
+{"expected_resume_s": N}` when the composition configures the expected wait.
 
 Delivery contract: **best-effort**. The sink retries transient failures and
 then drops the event with a warning — a broken status channel must not take
@@ -141,8 +154,10 @@ the agent run down. Per-session ordering is guaranteed by the sink's
 serialized per-session `seq`; cross-process resume tolerance comes from
 `state_since_ms` timestamps and idempotent `running` transitions.
 
-## 6. v1 boundaries (never emitted)
+## 6. Emission boundaries
 
-- `prediction` (§3.6) — requires an observation-statistics engine.
-- `strict_priority` (§3.4) — reserved for a trusted control plane.
+- `strict_priority` (§3.4) — reserved for a trusted control plane; only
+  emitted when explicitly injected.
 - `derivation.fork_point` (§3.2) — requires a message-index contract.
+- `prediction` measurements are process-local: a restart starts a fresh
+  rolling window unless `persist_path` carries the aggregates.

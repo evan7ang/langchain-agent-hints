@@ -128,7 +128,8 @@ gateway via `OPENAI_BASE_URL`.
 | `agent_status` | request-time lifecycle snapshot (always `running`) | middleware observation |
 | `priority` | level + audit reason (default `{level: 3, reason: user_waiting}`; subagents: `critical_path`) | constructor options |
 | `cache_control` | pin/ephemeral intent over message ranges (default: pin the system prompt `[0, 1)`) | constructor options |
-| `prediction`, `strict_priority` | defined by the protocol, **never emitted** in v1 | — |
+| `prediction` | measured serving estimates: `latency_ms`, `output_tokens`, `interval_ms`, `remaining_calls`, `remaining_time_ms`, `next_action` | in-plugin observation engine (rolling p90); omitted until enough samples |
+| `strict_priority` | reserved for a trusted control plane | constructor injection only; ordinary agents never set it |
 
 Full wire contract: [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 
@@ -155,12 +156,50 @@ shape `{"seq": N, "session": {...}, "agent_status": {...}}`:
 | `wrap_tool_call` exit | `running` | only when the last outstanding tool finishes |
 | `after_agent` | `finalize` | fires only on real completion (an approval pause suspends without finalize) |
 
-Pass `interrupt_tools=INTERRUPT_ON.keys()` (the human-approval gate names) so
-gated tool calls surface as `pause` events. Sinks implement the one-method
-`StatusEventSink` protocol; `JsonlStatusEventSink` persists to a JSONL file
-with per-session sequence numbers and retries transient failures. The sink
+With `subagent_tools={"task"}` (the default) a delegation call is reported as
+`tool` with `reason="join_barrier"`, the child agent name (`agent:<type>`) and
+`child_session_id` (`{thread_id}:{type}`). Pass `suspend_after_s=N` to report
+`suspend` (`reason="checkpoint"`) when an approval pause outlives N seconds,
+and `expected_resume_s=N` to attach the wait estimate to the pause event.
+
+Sinks implement the one-method `StatusEventSink` protocol; `JsonlStatusEventSink`
+persists to a JSONL file and `HttpStatusEventSink` posts to a gateway endpoint,
+both with per-session sequence numbers and retry-then-drop semantics. The sink
 interface is synchronous — async hooks call it inline, so use a buffered sink
 for slow transports.
+
+## Serving estimates (`prediction`)
+
+Unlike Dify (where platform boundaries force an out-of-band hint service), the
+LangChain hooks expose everything needed to measure in-process. The observation
+engine records, per agent type, a bounded rolling window of:
+
+- model-call latency (measured around the handler) and output tokens
+  (`usage_metadata`),
+- the inter-call interval (from the previous call's end to this call's start),
+- calls per session and session duration (closed in `after_agent`),
+- tool durations, and the model→tool / model→finalize transition counts
+  (including which tool follows a model call).
+
+When a hint is built, one value per metric is selected (nearest-rank quantile,
+default p90) and emitted as a partial `prediction` object. A metric is omitted
+until it has `min_samples` observations (default 3), so a fresh process sends
+no estimates rather than invented ones.
+
+```python
+from langchain_agent_hints import AgentHintsMiddleware, ObservationOptions
+
+AgentHintsMiddleware(
+    agent_type="my-agent",
+    observation=ObservationOptions(min_samples=5, quantile=0.9),
+    # Optional static overrides (per field, explicit values win):
+    # prediction=PredictionHint(output_tokens=512),
+)
+```
+
+Measurement is advisory and in-process: `ObservationOptions(enabled=False)`
+turns it off, and stats reset on restart unless `persist_path` points at a JSON
+file for aggregate carry-over.
 
 ## Disabling
 
@@ -209,7 +248,8 @@ CI runs the same suite on Python 3.11–3.13.
 
 - Publish to PyPI and list under the LangChain middleware integrations.
 - Async-friendly (buffered / async) sink interface.
-- `prediction` block: serving-side estimates from observation statistics.
+- Cross-process/cross-replica observation aggregation (the in-plugin engine is
+  process-local today; `persist_path` carries aggregates across restarts).
 
 ## License
 

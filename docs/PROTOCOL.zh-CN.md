@@ -67,16 +67,16 @@ JSON 编码丢弃 `null`/未设置字段：**"不适用"的编码方式就是省
 
 `{level: int, reason: string}`。级别遵循协议示例：`3` = 等待用户的交互型工作（`user_waiting`）；sync-join 的子代理位于父关键路径上（`critical_path`）。
 
-- `priority`——Agent 自身的服务优先级。
-- `strict_priority`——**保留给可信控制面；普通 Agent 永不发射。**
+- `priority`——Agent 自身的服务优先级。级别在协议层折叠进二值域 `{1, 3}`（`3` = 用户介入/免准入，`1` = 其余；v1 遗留 `{2, 4}` 与越界值按准入线折叠，准入结果不变）。
+- `strict_priority`——**保留给可信控制面；普通 Agent 永不发射。** 仅当组合显式注入（构造参数）时才会序列化，绝不从 Agent 事实推导。
 
 ### 3.5 `cache_control`
 
 数组（或单对象）`{type: "pin" | "ephemeral", ttl_s?: int, range?: {start?: int, end?: int, unit?: "message" | "token"}}`，声明消息区间上的缓存意图。库默认 pin 系统提示词（区间 `[0, 1)`）——把组合本已保证的字节稳定前缀显式声明出来。
 
-### 3.6 `prediction`（v1：永不发送）
+### 3.6 `prediction`（插件内实测）
 
-服务端预估：`latency_ms`、`remaining_calls`、`output_tokens`、`interval_ms`、`remaining_time_ms`、`expected_resume_s`、`next_action: {state, tools?: [{name, expected_duration_s?}], prob?}`。为前向兼容而定义；填充它需要观测统计引擎。
+服务端预估：`latency_ms`、`remaining_calls`、`output_tokens`、`interval_ms`、`remaining_time_ms`、`expected_resume_s`、`next_action: {state, tools?: [{name, expected_duration_s?}], prob?}`。由插件内观测引擎填充（按 agent_type 滚动统计，每指标取单值——最近秩分位，默认 p90）。该对象允许部分字段：样本不足的指标省略，省略即"无预估"；构造参数中的静态值按字段覆盖实测值。
 
 ## 4. 发射规则（带内）
 
@@ -98,12 +98,14 @@ JSON 编码丢弃 `null`/未设置字段：**"不适用"的编码方式就是省
 | `pause`（`reason: human_approval`） | 模型响应包含被人审门控的工具调用，恰在挂起开始之前。 |
 | `tool`（`reason: await_tool`） | 工具调用开始；`tools` 列出 `{name, call_id}`。 |
 | `running`（自 `tool`） | 会话**最后一个**在途工具完成（并行工具批只在最后一个 result 后报 running）。 |
+| `tool`（`reason: join_barrier`） | 委派工具（deepagents `task`）开始；`tools` 给出子 Agent 名（`agent:<type>`）与 `child_session_id`。父会话阻塞等待子会话。 |
+| `suspend`（`reason: checkpoint`） | 审批挂起超过配置的 `suspend_after_s` 阈值（可选，默认关闭）。 |
 | `finalize` | 图运行真正完成。审批挂起中途暂停不触发 finalize；恢复后的运行恰好 finalize 一次。 |
 
-投递契约：**尽力而为**。sink 对瞬时失败重试数次后丢弃并告警——状态通道故障不得拖垮 Agent 运行。会话内顺序由 sink 的串行化 per-session `seq` 保证；跨进程恢复容忍来自 `state_since_ms` 时间戳与幂等的 `running` 转换。
+`pause` 事件可携带预估块：配置了预期等待时附 `"prediction": {"expected_resume_s": N}`。投递契约：**尽力而为**。sink 对瞬时失败重试数次后丢弃并告警——状态通道故障不得拖垮 Agent 运行。会话内顺序由 sink 的串行化 per-session `seq` 保证；跨进程恢复容忍来自 `state_since_ms` 时间戳与幂等的 `running` 转换。
 
-## 6. v1 边界（永不发射）
+## 6. 发射边界
 
-- `prediction`（§3.6）——需要观测统计引擎。
-- `strict_priority`（§3.4）——保留给可信控制面。
+- `strict_priority`（§3.4）——保留给可信控制面；仅在显式注入时发送。
 - `derivation.fork_point`（§3.2）——需要消息序号契约。
+- `prediction` 的观测为进程内：重启后从新的滚动窗口开始，除非 `persist_path` 携带聚合。

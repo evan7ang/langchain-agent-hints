@@ -81,10 +81,54 @@ def test_state_since_ms_falls_back_to_now() -> None:
     assert wire["agent_status"]["state_since_ms"] == 1234
 
 
-def test_v1_never_emits_prediction_or_strict_priority() -> None:
+def test_default_build_omits_prediction_and_strict_priority() -> None:
     wire = hint_to_dict(build_agent_hint(_root_facts(), HintOptions(agent_type="a"), now_ms=1))
     assert "prediction" not in wire
     assert "strict_priority" not in wire
+
+
+def test_explicit_prediction_and_strict_priority_reach_the_wire() -> None:
+    from langchain_agent_hints.schema import NextActionHint, PredictedTool, PredictionHint
+
+    wire = hint_to_dict(
+        build_agent_hint(
+            _root_facts(),
+            HintOptions(agent_type="a"),
+            now_ms=1,
+            prediction=PredictionHint(
+                output_tokens=42,
+                next_action=NextActionHint(
+                    state="tool", tools=(PredictedTool(name="web_search"),), prob=0.8
+                ),
+            ),
+            strict_priority=PriorityHint(level=3, reason="critical_path"),
+        )
+    )
+    assert wire["prediction"] == {
+        "output_tokens": 42,
+        "next_action": {"state": "tool", "tools": [{"name": "web_search"}], "prob": 0.8},
+    }
+    assert wire["strict_priority"] == {"level": 3, "reason": "critical_path"}
+
+
+def test_build_folds_priority_levels() -> None:
+    folded = hint_to_dict(
+        build_agent_hint(
+            _root_facts(),
+            HintOptions(agent_type="a", priority=PriorityHint(level=7, reason="user_waiting")),
+            now_ms=1,
+        )
+    )
+    assert folded["priority"] == {"level": 3, "reason": "user_waiting"}
+
+    legacy = hint_to_dict(
+        build_agent_hint(
+            _root_facts(),
+            HintOptions(agent_type="a", priority=PriorityHint(level=2, reason="background")),
+            now_ms=1,
+        )
+    )
+    assert legacy["priority"] == {"level": 1, "reason": "background"}
 
 
 def test_option_overrides_reach_the_wire() -> None:

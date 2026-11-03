@@ -23,6 +23,15 @@
 - `after_agent` 只在图运行真正完成时触发；审批挂起（`interrupt()`）中途暂停不会到达它，恢复后的运行恰好 finalize 一次。
 - 被门控工具在挂起期间不会到达 `wrap_tool_call`（无虚假 `tool` 事件），批准后才到达——即自然的恢复信号。
 
+## 插件内观测（实测）
+
+- `wrap_model_call` 能读到 handler 结果 `AIMessage.usage_metadata`（`input_tokens` / `output_tokens` / `total_tokens`）；不返回 usage 的模型只是不产生 `output_tokens` 样本。
+- 延迟围绕 handler 实测（含排队）；`wrap_tool_call` 同样实测工具耗时。
+- 间隔样本 = 上一次调用结束到本次调用开始的差值（状态推导，无计数器丢失）。
+- `remaining_calls` / `remaining_time_ms` 来自同 `agent_type` 的已完成会话，是估计值而非编排层知识。
+- `next_action` 从模型→tool / 模型→finalize 转换学习（多数投票 + 最常见后继工具）；冷启动进程不发送。
+- 聚合线程安全且有界（`max_samples` 默认 256）；`persist_path` JSON 可跨重启携带。
+
 ## 已知限制（v1）
 
 - **同名并发子代理**在会话 id（`{thread_id}:{agent_name}`）上冲突：同名子代理两个并发运行的事件与 epoch 会交错。

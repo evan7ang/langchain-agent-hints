@@ -31,8 +31,11 @@ verified against deepagents 0.7.15 + langchain 1.4.1:
 
 Session identity comes from ``resolve_session_identity()`` (same rules as the
 hint header). Events are protocol §4 objects — ``{"session": {...},
-"agent_status": {...}}`` — handed to the configured sink; ``prediction`` is
-never attached (unchanged v1 boundary). Delivery is best-effort at the
+"agent_status": {...}}`` — handed to the configured sink. Delegation tools
+(deepagents ``task``) report ``tool`` with ``reason="join_barrier"``, the
+child agent name (``agent:<type>``) and the child session id; a pause that
+outlives ``suspend_after_s`` reports ``suspend`` (``checkpoint``); the pause
+event carries ``prediction.expected_resume_s`` when configured. Delivery is best-effort at the
 transport boundary: the sink retries transient failures and then drops with
 a warning — a broken status channel must not take the agent run down (the
 events are advisory scheduling signals). Order per session is guaranteed by
@@ -49,6 +52,8 @@ import json
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -113,15 +118,64 @@ class JsonlStatusEventSink:
             )
 
 
+class HttpStatusEventSink:
+    """POST status events to a gateway endpoint (stdlib, best-effort).
+
+    The event object is sent as-is (plus a per-session ``seq``), matching the
+    reference ``POST /agent-status`` route of the hint service. Transient
+    failures retry and then drop with a warning — the status channel is
+    advisory and must never take the agent run down.
+    """
+
+    def __init__(self, url: str, *, attempts: int = 3, timeout: float = 2.0) -> None:
+        self._url = url
+        self._attempts = attempts
+        self._timeout = timeout
+        self._lock = threading.Lock()
+        self._seqs: dict[str, int] = {}
+
+    def send(self, event: dict[str, Any]) -> None:
+        session_id = str((event.get("session") or {}).get("session_id", ""))
+        with self._lock:
+            seq = self._seqs.get(session_id, 0) + 1
+            self._seqs[session_id] = seq
+            record = {"seq": seq, **event}
+            payload = json.dumps(record, ensure_ascii=False, default=str).encode("utf-8")
+            last_error: Exception | None = None
+            for _ in range(self._attempts):
+                request = urllib.request.Request(
+                    self._url,
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                try:
+                    with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                        response.read()
+                    return
+                except (urllib.error.URLError, OSError) as error:  # transient transport
+                    last_error = error
+        print(
+            f"langchain-agent-hints: status event dropped after {self._attempts} "
+            f"post attempts to {self._url}: {last_error}",
+            file=sys.stderr,
+        )
+
+
 def status_event(
     session_id: str,
     state: AgentState,
     *,
     reason: str | None = None,
     tools: tuple[StatusTool, ...] | None = None,
+    prediction: dict[str, Any] | None = None,
     now_ms: int,
 ) -> dict[str, Any]:
-    """Build one protocol §4 status event object (``session`` + ``agent_status``)."""
+    """Build one protocol §4 status event object (``session`` + ``agent_status``).
+
+    ``prediction`` is the optional estimate block some transitions carry (the
+    protocol's approval-pause example attaches ``{"expected_resume_s": ...}``).
+    """
     event: dict[str, Any] = {"session": {"session_id": session_id}}
     agent_status: dict[str, Any] = {"state": state, "state_since_ms": now_ms}
     if reason is not None:
@@ -129,6 +183,8 @@ def status_event(
     if tools:
         agent_status["tools"] = _status_tool_entries(tools)
     event["agent_status"] = agent_status
+    if prediction:
+        event["prediction"] = prediction
     return event
 
 
@@ -171,16 +227,28 @@ class AgentStatusEventsMiddleware(AgentMiddleware):
         *,
         sink: StatusEventSink | None = None,
         interrupt_tools: frozenset[str] | set[str] = frozenset(),
+        subagent_tools: frozenset[str] | set[str] = frozenset({"task"}),
+        suspend_after_s: float | None = None,
+        expected_resume_s: float | None = None,
         clock: Callable[[], int] | None = None,
     ) -> None:
         """``interrupt_tools`` are the human-approval gate keys (composition
         passes them); a model response calling one of them is reported as the
-        ``human_approval`` pause. ``clock`` is injectable for tests."""
+        ``human_approval`` pause. ``subagent_tools`` are delegation tool names
+        (deepagents: ``task``) reported as a ``join_barrier`` tool wait with
+        the child session id. ``suspend_after_s`` reports ``suspend``
+        (``checkpoint``) when an approval pause lasts longer than the given
+        seconds; ``expected_resume_s`` rides the pause event's ``prediction``.
+        ``clock`` is injectable for tests."""
         self._sink = sink or _DiscardSink()
         self._interrupt_tools = frozenset(interrupt_tools)
+        self._subagent_tools = frozenset(subagent_tools)
+        self._suspend_after_s = suspend_after_s
+        self._expected_resume_s = expected_resume_s
         self._clock = clock or (lambda: time.time_ns() // 1_000_000)
         self._lock = threading.Lock()
         self._sessions: dict[str, _SessionState] = {}
+        self._suspend_timers: dict[str, threading.Timer] = {}
 
     # -- transition machinery ------------------------------------------------
 
@@ -191,6 +259,7 @@ class AgentStatusEventsMiddleware(AgentMiddleware):
         *,
         reason: str | None = None,
         tools: tuple[StatusTool, ...] | None = None,
+        prediction: dict[str, Any] | None = None,
         dedupe_running: bool = False,
     ) -> None:
         """Emit one transition unless it is a redundant ``running`` repeat.
@@ -207,17 +276,56 @@ class AgentStatusEventsMiddleware(AgentMiddleware):
                 last_state=state,
                 outstanding_tools=track.outstanding_tools,
             )
+            self._cancel_suspend_timer_locked(session_id)
+            if state == "pause" and self._suspend_after_s is not None:
+                timer = threading.Timer(
+                    max(0.0, float(self._suspend_after_s)),
+                    self._suspend_if_paused,
+                    args=(session_id,),
+                )
+                timer.daemon = True
+                self._suspend_timers[session_id] = timer
+                timer.start()
         self._sink.send(
             status_event(
                 session_id,
                 state,
                 reason=reason,
                 tools=tools,
+                prediction=prediction,
                 now_ms=self._clock(),
             )
         )
 
-    def _begin_tool(self, session_id: str, tool: StatusTool) -> None:
+    def _cancel_suspend_timer_locked(self, session_id: str) -> None:
+        timer = self._suspend_timers.pop(session_id, None)
+        if timer is not None:
+            timer.cancel()
+
+    def _suspend_if_paused(self, session_id: str) -> None:
+        """Emit ``suspend`` (``checkpoint``) when a pause outlives the threshold."""
+        with self._lock:
+            track = self._sessions.get(session_id, _UNSET)
+            if track.last_state != "pause":
+                return
+            self._sessions[session_id] = _SessionState(
+                last_state="suspend",
+                outstanding_tools=track.outstanding_tools,
+            )
+            self._suspend_timers.pop(session_id, None)
+        self._sink.send(
+            status_event(session_id, "suspend", reason="checkpoint", now_ms=self._clock())
+        )
+
+    def close(self) -> None:
+        """Cancel pending suspend timers (tests / composition teardown)."""
+        with self._lock:
+            timers = list(self._suspend_timers.values())
+            self._suspend_timers.clear()
+        for timer in timers:
+            timer.cancel()
+
+    def _begin_tool(self, session_id: str, tool: StatusTool, *, reason: str = "await_tool") -> None:
         """Record one in-flight tool and emit its ``await_tool`` event atomically."""
         with self._lock:
             track = self._sessions.get(session_id, _UNSET)
@@ -229,7 +337,7 @@ class AgentStatusEventsMiddleware(AgentMiddleware):
             status_event(
                 session_id,
                 "tool",
-                reason="await_tool",
+                reason=reason,
                 tools=(tool,),
                 now_ms=self._clock(),
             )
@@ -276,6 +384,7 @@ class AgentStatusEventsMiddleware(AgentMiddleware):
                 "pause",
                 reason="human_approval",
                 tools=gated,
+                prediction=_resume_prediction(self._expected_resume_s),
             )
         return response
 
@@ -293,10 +402,8 @@ class AgentStatusEventsMiddleware(AgentMiddleware):
         if identity is None:
             return handler(request)
         call = request.tool_call
-        self._begin_tool(
-            identity.session_id,
-            StatusTool(name=str(call["name"]), call_id=str(call.get("id"))),
-        )
+        tool, reason = _tool_wait(identity, call, self._subagent_tools)
+        self._begin_tool(identity.session_id, tool, reason=reason)
         try:
             return handler(request)
         finally:
@@ -330,6 +437,7 @@ class AgentStatusEventsMiddleware(AgentMiddleware):
                 "pause",
                 reason="human_approval",
                 tools=gated,
+                prediction=_resume_prediction(self._expected_resume_s),
             )
         return response
 
@@ -345,10 +453,8 @@ class AgentStatusEventsMiddleware(AgentMiddleware):
         if identity is None:
             return await handler(request)
         call = request.tool_call
-        self._begin_tool(
-            identity.session_id,
-            StatusTool(name=str(call["name"]), call_id=str(call.get("id"))),
-        )
+        tool, reason = _tool_wait(identity, call, self._subagent_tools)
+        self._begin_tool(identity.session_id, tool, reason=reason)
         try:
             return await handler(request)
         finally:
@@ -361,6 +467,40 @@ class AgentStatusEventsMiddleware(AgentMiddleware):
             return None
         self._transition(identity.session_id, "finalize")
         return None
+
+
+def _tool_wait(
+    identity: Any, call: dict[str, Any], subagent_tools: frozenset[str]
+) -> tuple[StatusTool, str]:
+    """Describe one tool wait; delegation tools report a ``join_barrier``.
+
+    deepagents' ``task`` tool takes ``subagent_type``; the parent blocks on
+    the child (foreground), so the event names the child agent and carries the
+    child session id (same ``{thread_id}:{agent_name}`` convention the child
+    hints use).
+    """
+    name = str(call.get("name") or "")
+    call_id = str(call.get("id")) if call.get("id") is not None else None
+    if name in subagent_tools:
+        args = call.get("args") or {}
+        subagent_type = (
+            str(args.get("subagent_type") or "subagent") if isinstance(args, dict) else "subagent"
+        )
+        return (
+            StatusTool(
+                name=f"agent:{subagent_type}",
+                call_id=call_id,
+                child_session_id=f"{identity.thread_id}:{subagent_type}",
+            ),
+            "join_barrier",
+        )
+    return StatusTool(name=name, call_id=call_id), "await_tool"
+
+
+def _resume_prediction(expected_resume_s: float | None) -> dict[str, Any] | None:
+    if expected_resume_s is None:
+        return None
+    return {"expected_resume_s": expected_resume_s}
 
 
 def _response_messages(response: Any) -> list[Any]:
