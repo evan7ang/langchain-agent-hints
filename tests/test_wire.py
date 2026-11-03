@@ -38,7 +38,8 @@ def _assert_hint_shape(record: dict[str, Any], *, thread_id: str, agent_type: st
     assert "derivation" not in hint["session"]
     assert hint["agent_status"]["state"] == "running"
     assert hint["priority"] == {"level": 3, "reason": "user_waiting"}
-    assert hint["cache_control"] == [{"type": "pin", "range": {"end": 1}}]
+    # Below one 128-token cache block the guide forbids a declaration.
+    assert "cache_control" not in hint
     # A single call has no observations yet: the measured block is omitted.
     assert "prediction" not in hint and "strict_priority" not in hint
 
@@ -100,3 +101,29 @@ def test_fake_model_path_ignores_unknown_bind_kwargs() -> None:
         {"messages": [("user", "hi")]}, config={"configurable": {"thread_id": "t-fake"}}
     )
     assert result["messages"][-1].content == "ok"
+
+
+def test_long_prefix_declares_ephemeral_cache(stub_server) -> None:
+    """A prefix over one 128-token block gets the guide's single declaration."""
+    from langchain_openai import ChatOpenAI
+
+    stub_url, capture = stub_server
+    model = ChatOpenAI(model="stub-model", api_key="agent-hints-test-dummy", base_url=stub_url)
+    agent = create_agent(
+        model=model,
+        system_prompt="cache block " * 120,  # ~360 tokens
+        middleware=[AgentHintsMiddleware(agent_type="cache-agent")],
+    )
+    agent.invoke(
+        {"messages": [("user", "cache probe")]},
+        config={"configurable": {"thread_id": "wire-cache"}},
+    )
+    records = _records(capture)
+    hint = independent_decode(records[0]["headers"][HINT_HEADER.lower()])
+    assert hint["cache_control"] == [
+        {
+            "type": "ephemeral",
+            "ttl_s": 600,  # cold start: 300 s fallback * 2
+            "range": {"end": 2, "unit": "message"},  # system + user
+        }
+    ]

@@ -32,6 +32,13 @@
 - `next_action` 从模型→tool / 模型→finalize 转换学习（多数投票 + 最常见后继工具）；冷启动进程不发送。
 - 聚合线程安全且有界（`max_samples` 默认 256）；`persist_path` JSON 可跨重启携带。
 
+## 真实取值推导（v0.3.0）
+
+- `ModelRequest.messages` **不含** system 消息，system 在 `request.system_message`；`range.end` = `len(messages) + (1 if system_message else 0)`。
+- `priority` 分类看最后一条消息的角色：`HumanMessage` → `3/user_waiting`；工具结果 → `1/critical_path`（自驱续接）。审批恢复窗口由状态中间件通过共享 `RunSignals` 标记（一次性），因为恢复请求的最后一条是工具结果。
+- `cache_control` 的 TTL 用**最常见后继工具**最近 20 条的 p90 耗时（按工具而非调用位置，指南的近似），否则回落到实测调用间隔。
+- 模型/工具/system 指纹变化会抑制当轮声明（缓存键失效），epoch 递增同理。
+
 ## 已知限制（v1）
 
 - **同名并发子代理**在会话 id（`{thread_id}:{agent_name}`）上冲突：同名子代理两个并发运行的事件与 epoch 会交错。

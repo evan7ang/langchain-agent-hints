@@ -64,6 +64,7 @@ from langchain_core.messages import AIMessage
 
 from langchain_agent_hints.middleware import resolve_session_identity
 from langchain_agent_hints.schema import AgentState, StatusTool
+from langchain_agent_hints.signals import RunSignals
 
 
 class StatusEventSink(Protocol):
@@ -230,6 +231,7 @@ class AgentStatusEventsMiddleware(AgentMiddleware):
         subagent_tools: frozenset[str] | set[str] = frozenset({"task"}),
         suspend_after_s: float | None = None,
         expected_resume_s: float | None = None,
+        signals: RunSignals | None = None,
         clock: Callable[[], int] | None = None,
     ) -> None:
         """``interrupt_tools`` are the human-approval gate keys (composition
@@ -245,6 +247,7 @@ class AgentStatusEventsMiddleware(AgentMiddleware):
         self._subagent_tools = frozenset(subagent_tools)
         self._suspend_after_s = suspend_after_s
         self._expected_resume_s = expected_resume_s
+        self._signals = signals or RunSignals()
         self._clock = clock or (lambda: time.time_ns() // 1_000_000)
         self._lock = threading.Lock()
         self._sessions: dict[str, _SessionState] = {}
@@ -277,6 +280,7 @@ class AgentStatusEventsMiddleware(AgentMiddleware):
                 outstanding_tools=track.outstanding_tools,
             )
             self._cancel_suspend_timer_locked(session_id)
+            self._signals.observe_transition(session_id, track.last_state, state, self._clock())
             if state == "pause" and self._suspend_after_s is not None:
                 timer = threading.Timer(
                     max(0.0, float(self._suspend_after_s)),
@@ -312,10 +316,16 @@ class AgentStatusEventsMiddleware(AgentMiddleware):
                 last_state="suspend",
                 outstanding_tools=track.outstanding_tools,
             )
+            self._signals.observe_transition(session_id, "pause", "suspend", self._clock())
             self._suspend_timers.pop(session_id, None)
         self._sink.send(
             status_event(session_id, "suspend", reason="checkpoint", now_ms=self._clock())
         )
+
+    @property
+    def signals(self) -> RunSignals:
+        """The shared run signals (mount the hint middleware with the same)."""
+        return self._signals
 
     def close(self) -> None:
         """Cancel pending suspend timers (tests / composition teardown)."""
@@ -333,6 +343,7 @@ class AgentStatusEventsMiddleware(AgentMiddleware):
                 last_state="tool",
                 outstanding_tools=track.outstanding_tools + 1,
             )
+            self._signals.observe_transition(session_id, track.last_state, "tool", self._clock())
         self._sink.send(
             status_event(
                 session_id,

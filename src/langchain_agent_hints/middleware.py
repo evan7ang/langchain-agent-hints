@@ -23,26 +23,37 @@ Emission rules (docs/PROTOCOL.md §4/§5):
   hinted — only requests that flow through ``wrap_model_call`` are;
 - ``call_index`` is derived from the persistent message history
   (``1 + count(AIMessage in request.messages)``): the history lives in the
-  checkpointer, so the counter survives process restarts with zero state —
-  LangGraph has no per-call event stream to derive it from;
+  checkpointer, so the counter survives process restarts with zero state;
 - ``epoch`` stays a per-session in-process fact: bumped when the message
-  prefix is rewritten (count shrinks or the first message changes — the
-  summarization signal).
+  prefix is rewritten (count shrinks or the first message changes).
 
-Serving estimates (``prediction``) are measured in-plugin by
-:class:`langchain_agent_hints.observation.ObservationStore`: this middleware
-records model-call latency/output tokens, tool durations and model→tool/
-finalize transitions through its own hooks, and reads the rolling aggregates
-when it builds the next hint. ``strict_priority`` is only emitted when a
-trusted control plane injects it (constructor argument); agent facts never
-produce it. Priority levels are folded into the contracted ``{1, 3}`` domain
-at the protocol layer.
+Real value derivation (v0.3.0):
+
+- ``priority`` — ``"auto"`` classifies the request trigger: a human message is
+  user-intervened (``3/user_waiting``), an approval resume (shared
+  ``RunSignals``) is the same window, a tool-result continuation and a
+  subagent run are ``1/critical_path`` (self-driven), and ``run_mode="batch"``
+  reports ``1/background``. Explicit ``PriorityHint`` values still win.
+- ``cache_control`` — ``"auto"`` rebuilds the declaration per the
+  cache-control guide: one ``ephemeral`` entry, explicit TTL
+  (``clamp(gap*2, 60, 3600)`` from the next-tool estimate / last interval /
+  300 s fallback), ``range.end`` = logical input count (``[system?] +
+  messages``), and no declaration for a <128-token prefix, a rewritten
+  prefix (epoch bump), or a changed model/tool set.
+- ``agent_status.state_since_ms`` — the status middleware's tracked
+  transition instant via ``RunSignals`` (request wall clock as the fallback).
+
+Observation (``prediction``) stays in-plugin: this middleware records
+model-call latency/output tokens, tool durations and model→tool/finalize
+transitions through its own hooks. ``strict_priority`` is only emitted when a
+trusted control plane injects it.
 
 Failure semantics: hint construction is deterministic over config facts, so
 ``wrap_model_call`` has no swallow-and-continue path — a bug here fails
 loudly rather than silently degrading every request. Ops opt-out: drop this
-middleware from the composition (see README "Disabling") or pass an
-``ObservationOptions(enabled=False)`` store to disable measurement only.
+middleware from the composition (see README "Disabling") or pass
+``priority=None`` / ``cache_control=None`` / an ``ObservationOptions`` store
+with measurement disabled.
 """
 
 from __future__ import annotations
@@ -56,14 +67,17 @@ from dataclasses import dataclass
 from typing import Any
 
 from langchain.agents.middleware import AgentMiddleware
-from langchain_core.messages import AIMessage, AnyMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
 from langchain_core.runnables import ensure_config
 
 from langchain_agent_hints.observation import ObservationOptions, ObservationStore
+from langchain_agent_hints.policy import (
+    build_cache_control,
+    estimate_tokens,
+    estimate_ttl_s,
+    logical_message_count,
+)
 from langchain_agent_hints.schema import (
-    DEFAULT_CACHE_CONTROL,
-    DEFAULT_PRIORITY,
-    DEFAULT_SUBAGENT_PRIORITY,
     HINT_HEADER,
     CacheControlHint,
     DerivationJoin,
@@ -75,6 +89,10 @@ from langchain_agent_hints.schema import (
     build_agent_hint,
     encode_agent_hint,
 )
+from langchain_agent_hints.signals import RunSignals
+
+#: Policy sentinel: derive the value from the request/observations.
+AUTO = "auto"
 
 
 @dataclass(frozen=True)
@@ -150,12 +168,7 @@ def _call_index(messages: list[AnyMessage]) -> int:
 
 
 def _response_messages(response: Any) -> list[Any]:
-    """Model messages inside one ``wrap_model_call`` handler result.
-
-    The handler contract allows ``ModelResponse`` (``.result`` messages),
-    a bare ``AIMessage``, or an extended response; only the message list is
-    of interest here, everything else degrades to an empty list.
-    """
+    """Model messages inside one ``wrap_model_call`` handler result."""
     if isinstance(response, AIMessage):
         return [response]
     result = getattr(response, "result", None)
@@ -179,6 +192,37 @@ def _response_facts(response: Any) -> tuple[int | None, bool]:
         if message.tool_calls:
             had_tool_calls = True
     return output_tokens, had_tool_calls
+
+
+def _system_content(request: Any) -> str | None:
+    system = getattr(request, "system_message", None)
+    if system is None:
+        return None
+    content = getattr(system, "content", None)
+    return content if isinstance(content, str) else str(content) if content is not None else ""
+
+
+def _prefix_key(request: Any) -> str:
+    """Model + tool-set + system-prompt identity (cache-prefix invalidation key)."""
+    model = getattr(request.model, "model_name", None) or getattr(request.model, "model", None)
+    model_id = str(model or type(request.model).__name__)
+    tools = []
+    for tool in getattr(request, "tools", None) or []:
+        name = getattr(tool, "name", None)
+        if name is None and isinstance(tool, dict):
+            name = tool.get("name")
+        tools.append(str(name or type(tool).__name__))
+    system = _system_content(request) or ""
+    payload = json.dumps([model_id, sorted(tools), system], ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _prefix_tokens(request: Any) -> int:
+    contents: list[Any] = [
+        getattr(message, "content", None) for message in getattr(request, "messages", None) or []
+    ]
+    contents.append(_system_content(request))
+    return estimate_tokens(contents)
 
 
 def _merge_prediction(
@@ -223,13 +267,14 @@ def _merge_prediction(
 
 
 class _SessionTrack:
-    """Per-session in-process serving facts (``epoch`` only since v1.1)."""
+    """Per-session in-process facts (epoch, cache-prefix key)."""
 
-    __slots__ = ("epoch", "fingerprint")
+    __slots__ = ("epoch", "fingerprint", "prefix_key")
 
     def __init__(self) -> None:
         self.epoch = 0
         self.fingerprint: tuple[int, str] | None = None
+        self.prefix_key: str | None = None
 
 
 class AgentHintsMiddleware(AgentMiddleware):
@@ -247,39 +292,57 @@ class AgentHintsMiddleware(AgentMiddleware):
         self,
         *,
         agent_type: str,
-        priority: PriorityHint | None = DEFAULT_PRIORITY,
-        subagent_priority: PriorityHint | None = DEFAULT_SUBAGENT_PRIORITY,
-        cache_control: tuple[CacheControlHint, ...] | None = DEFAULT_CACHE_CONTROL,
+        priority: PriorityHint | None | str = AUTO,
+        subagent_priority: PriorityHint | None | str = AUTO,
+        cache_control: tuple[CacheControlHint, ...] | None | str = AUTO,
         strict_priority: PriorityHint | None = None,
         prediction: PredictionHint | None = None,
         observation: ObservationOptions | ObservationStore | None = None,
+        signals: RunSignals | None = None,
+        run_mode: str = "interactive",
         clock: Callable[[], int] | None = None,
     ) -> None:
         """Fix the composition-level hint policy.
 
-        ``agent_type`` is the serving-side name of the composed agent (no
-        default: it is composition-specific). ``subagent_priority`` applies to
-        child requests (protocol example: sync-joined children sit on the
-        critical path); ``clock`` returns epoch milliseconds and is injectable
-        for tests.
+        ``priority`` / ``subagent_priority``: ``"auto"`` derives the value
+        from the request trigger (human message, approval resume, tool
+        continuation, subagent run, ``run_mode="batch"``); an explicit
+        ``PriorityHint`` pins it; ``None`` omits the field.
 
-        ``strict_priority`` is control-plane-only: ordinary agents never set
-        it, so it is emitted only when the composition explicitly injects it.
-        ``prediction`` supplies static overrides for the measured estimates
-        (per-field: an explicit value wins over the observation engine).
-        ``observation`` is an ``ObservationOptions`` (engine config) or a
-        shared ``ObservationStore``; measurement is on by default.
+        ``cache_control``: ``"auto"`` builds the guide-compliant declaration
+        per request; an explicit tuple pins it; ``None`` omits the field.
+
+        ``signals``: share one ``RunSignals`` with ``AgentStatusEventsMiddleware``
+        to get the tracked ``state_since_ms`` and approval-resume priority.
+
+        ``strict_priority`` is control-plane-only (emitted only when injected).
+        ``prediction`` supplies static per-field overrides for the measured
+        estimates. ``observation`` is an ``ObservationOptions`` (engine config)
+        or a shared ``ObservationStore``; measurement is on by default.
         """
-        self._options = HintOptions(
-            agent_type=agent_type, priority=priority, cache_control=cache_control
-        )
-        self._subagent_priority = subagent_priority
+        if run_mode not in ("interactive", "batch"):
+            msg = f"run_mode must be 'interactive' or 'batch', got {run_mode!r}"
+            raise ValueError(msg)
+        for name, value in (
+            ("priority", priority),
+            ("subagent_priority", subagent_priority),
+            ("cache_control", cache_control),
+        ):
+            if isinstance(value, str) and value != AUTO:
+                msg = f"{name} must be {AUTO!r}, an explicit value, or None; got {value!r}"
+                raise ValueError(msg)
+        self._agent_type = agent_type
+        self._priority_policy = priority
+        self._subagent_priority_policy = subagent_priority
+        self._cache_policy = cache_control
         self._strict_priority = strict_priority
         self._configured_prediction = prediction
+        self._run_mode = run_mode
         if isinstance(observation, ObservationStore):
             self._observation = observation
         else:
             self._observation = ObservationStore(observation or ObservationOptions())
+        self._signals = signals or RunSignals()
         self._clock = clock or (lambda: time.time_ns() // 1_000_000)
         self._lock = threading.Lock()
         self._tracks: dict[str, _SessionTrack] = {}
@@ -289,33 +352,92 @@ class AgentHintsMiddleware(AgentMiddleware):
         """The observation engine this middleware records into / reads from."""
         return self._observation
 
+    @property
+    def signals(self) -> RunSignals:
+        """The shared run signals (mount the status middleware with the same)."""
+        return self._signals
+
     def _agent_type_for(self, identity: SessionIdentity) -> str:
         if identity.is_subagent:
             return identity.agent_name or "subagent"
-        return self._options.agent_type
+        return self._agent_type
 
-    def _take_epoch_slot(self, session_id: str, fingerprint: tuple[int, str]) -> int:
-        """Bump the session epoch when the message prefix was rewritten.
-
-        Serialized so concurrent subagents cannot interleave fingerprint
-        updates for the same session id.
-        """
+    def _take_epoch_slot(self, session_id: str, fingerprint: tuple[int, str]) -> tuple[int, bool]:
+        """Update the session epoch; return ``(epoch, prefix_rewritten)``."""
         with self._lock:
             track = self._tracks.setdefault(session_id, _SessionTrack())
             previous = track.fingerprint
-            if previous is not None and (
+            rewritten = previous is not None and (
                 fingerprint[0] < previous[0] or fingerprint[1] != previous[1]
-            ):
+            )
+            if rewritten:
                 track.epoch += 1
             track.fingerprint = fingerprint
-            return track.epoch
+            return track.epoch, rewritten
+
+    def _take_prefix_key(self, session_id: str, key: str) -> bool:
+        """Record the model/tool/system key; ``True`` when it changed."""
+        with self._lock:
+            track = self._tracks.setdefault(session_id, _SessionTrack())
+            previous = track.prefix_key
+            track.prefix_key = key
+            return previous is not None and previous != key
+
+    def _resolve_priority(self, identity: SessionIdentity, request: Any) -> PriorityHint | None:
+        policy = self._subagent_priority_policy if identity.is_subagent else self._priority_policy
+        if policy is None:
+            return None
+        if not isinstance(policy, str):  # explicit PriorityHint
+            return policy
+        if self._signals.take_resumed(identity.session_id):
+            return PriorityHint(level=3, reason="user_waiting")
+        if self._run_mode == "batch":
+            return PriorityHint(level=1, reason="background")
+        if identity.is_subagent:
+            return PriorityHint(level=1, reason="critical_path")
+        messages = getattr(request, "messages", None) or []
+        if messages and isinstance(messages[-1], HumanMessage):
+            return PriorityHint(level=3, reason="user_waiting")
+        return PriorityHint(level=1, reason="critical_path")
+
+    def _resolve_cache_control(
+        self,
+        identity: SessionIdentity,
+        request: Any,
+        *,
+        prefix_rewritten: bool,
+        agent_type: str,
+    ) -> tuple[CacheControlHint, ...] | None:
+        policy = self._cache_policy
+        if policy is None:
+            return None
+        if not isinstance(policy, str):  # explicit tuple
+            return policy
+        if prefix_rewritten:
+            return None
+        if self._take_prefix_key(identity.session_id, _prefix_key(request)):
+            return None
+        logical = logical_message_count(
+            list(getattr(request, "messages", None) or []),
+            system_present=getattr(request, "system_message", None) is not None,
+        )
+        next_tool = self._observation.predicted_next_tool(agent_type)
+        tool_expected = self._observation.tool_expected_s(agent_type, next_tool)
+        ttl = estimate_ttl_s(
+            tool_expected_s=tool_expected,
+            interval_ms=self._observation.last_interval_ms(identity.session_id),
+        )
+        return build_cache_control(
+            logical_count=logical,
+            prefix_tokens=_prefix_tokens(request),
+            ttl_s=ttl,
+        )
 
     def _hinted_request(self, request: Any) -> Any | None:
         """Build the hint for one request and return the overridden request.
 
         ``None`` when the run has no session identity — the degradation rule
-        (no identity, no hint), matching the protocol's mandatory ``session``
-        block.
+        (no identity, no hint), matching the protocol's mandatory ``session``.
         """
         identity = resolve_session_identity()
         if identity is None:
@@ -326,39 +448,38 @@ class AgentHintsMiddleware(AgentMiddleware):
         if identity.is_subagent:
             parent_session_id = identity.thread_id
             relation = "spawn"
-            # deepagents task subagents are foreground-blocking: the parent
-            # waits for the child result, so the join semantics are exactly
-            # the protocol's "sync".
             join = "sync"
-            agent_type = identity.agent_name or "subagent"
-            priority = self._subagent_priority
         else:
             parent_session_id = None
             relation = None
             join = None
-            agent_type = self._options.agent_type
-            priority = self._options.priority
+        agent_type = self._agent_type_for(identity)
 
         now_ms = self._clock()
         call_index = _call_index(request.messages)
-        # Record the call start first: the measured inter-call gap feeds the
-        # interval estimate for this very request.
         self._observation.model_call_started(identity.session_id, now_ms=now_ms)
         measured = self._observation.prediction(
             identity.session_id, agent_type, call_index=call_index, now_ms=now_ms
         )
         prediction = _merge_prediction(measured, self._configured_prediction)
+        priority = self._resolve_priority(identity, request)
+        epoch, rewritten = self._take_epoch_slot(
+            identity.session_id, _fingerprint(request.messages)
+        )
+        cache_control = self._resolve_cache_control(
+            identity,
+            request,
+            prefix_rewritten=rewritten,
+            agent_type=agent_type,
+        )
+        state_since_ms = self._signals.state_since_ms(identity.session_id) or now_ms
 
-        epoch = self._take_epoch_slot(identity.session_id, _fingerprint(request.messages))
         hint = build_agent_hint(
             HintRequestFacts(
                 session_id=identity.session_id,
-                # Derived from the persistent message history (restart-safe).
                 call_index=call_index,
                 epoch=epoch,
-                # wrap_model_call runs right after the tools returned, so the
-                # wall clock is the closest available "running since" instant.
-                state_since_ms=now_ms,
+                state_since_ms=state_since_ms,
                 parent_session_id=parent_session_id,
                 parent_relation=relation,
                 parent_join=join,
@@ -366,7 +487,7 @@ class AgentHintsMiddleware(AgentMiddleware):
             HintOptions(
                 agent_type=agent_type,
                 priority=priority,
-                cache_control=self._options.cache_control,
+                cache_control=cache_control,
             ),
             now_ms=now_ms,
             prediction=prediction,
@@ -445,11 +566,13 @@ class AgentHintsMiddleware(AgentMiddleware):
 
     def _run_finished(self) -> None:
         identity = resolve_session_identity()
-        if identity is None or not self._observation.enabled:
+        if identity is None:
             return None
-        self._observation.run_finished(
-            identity.session_id, self._agent_type_for(identity), now_ms=self._clock()
-        )
+        if self._observation.enabled:
+            self._observation.run_finished(
+                identity.session_id, self._agent_type_for(identity), now_ms=self._clock()
+            )
+        self._signals.finish(identity.session_id)
         return None
 
     def after_agent(self, state: Any, runtime: Any) -> None:

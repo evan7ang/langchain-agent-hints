@@ -81,8 +81,12 @@ def test_two_calls_hinted_with_state_derived_call_index(tmp_path: Path) -> None:
     }
     assert second["session"]["call_index"] == 2
     assert first["agent_status"]["state"] == "running"
+    # A human message is user-intervened; a tool-result continuation is
+    # self-driven (binarization: only user intervention earns level 3).
     assert first["priority"] == {"level": 3, "reason": "user_waiting"}
-    assert first["cache_control"] == [{"type": "pin", "range": {"end": 1}}]
+    assert second["priority"] == {"level": 1, "reason": "critical_path"}
+    # The probe prefix is far below one 128-token cache block: no declaration.
+    assert "cache_control" not in first
     # Below the observation min_samples threshold the measured block is omitted.
     assert "prediction" not in first and "strict_priority" not in first
     assert "parent_session_id" not in first["session"]
@@ -136,8 +140,8 @@ def test_async_path_hints_identically(tmp_path: Path) -> None:
 
 def test_epoch_bumps_on_prefix_rewrite() -> None:
     mw = AgentHintsMiddleware(agent_type="t")
-    assert mw._take_epoch_slot("s", (3, "aaa")) == 0
-    assert mw._take_epoch_slot("s", (3, "aaa")) == 0  # same prefix: no bump
-    assert mw._take_epoch_slot("s", (2, "aaa")) == 1  # shrink: summarization signal
-    assert mw._take_epoch_slot("s", (2, "bbb")) == 2  # first message replaced
-    assert mw._take_epoch_slot("other", (1, "aaa")) == 0  # per-session isolation
+    assert mw._take_epoch_slot("s", (3, "aaa")) == (0, False)
+    assert mw._take_epoch_slot("s", (3, "aaa")) == (0, False)  # same prefix
+    assert mw._take_epoch_slot("s", (2, "aaa")) == (1, True)  # shrink signal
+    assert mw._take_epoch_slot("s", (2, "bbb")) == (2, True)  # first message changed
+    assert mw._take_epoch_slot("other", (1, "aaa")) == (0, False)  # per-session

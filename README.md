@@ -94,7 +94,10 @@ Requests then carry a header such as (base64url-decoded for readability):
   "session": {"session_id": "session-42", "agent_type": "my-agent", "call_index": 3, "epoch": 0},
   "agent_status": {"state": "running", "state_since_ms": 1730000000000},
   "priority": {"level": 3, "reason": "user_waiting"},
-  "cache_control": [{"type": "pin", "range": {"end": 1}}]
+  "cache_control": [
+    {"type": "ephemeral", "ttl_s": 240,
+     "range": {"end": 2, "unit": "message"}}
+  ]
 }
 ```
 
@@ -126,8 +129,8 @@ gateway via `OPENAI_BASE_URL`.
 | --- | --- | --- |
 | `session` | `session_id`, `agent_type`, `call_index`, `epoch`, optional `parent_session_id` + `derivation` | `thread_id`, constructor options, persistent message history |
 | `agent_status` | request-time lifecycle snapshot (always `running`) | middleware observation |
-| `priority` | level + audit reason (default `{level: 3, reason: user_waiting}`; subagents: `critical_path`) | constructor options |
-| `cache_control` | pin/ephemeral intent over message ranges (default: pin the system prompt `[0, 1)`) | constructor options |
+| `priority` | level + audit reason. Auto: human message / approval resume → `3/user_waiting`; tool continuation and subagent runs → `1/critical_path`; `run_mode="batch"` → `1/background` | request trigger + shared `RunSignals`; explicit `PriorityHint` overrides |
+| `cache_control` | one `ephemeral` declaration with an explicit TTL (`clamp(gap*2, 60, 3600)`); `range.end` = logical input count (`[system?] + messages`) | per-request derivation from the cache-control guide (next-tool p90 → last interval → 300 s fallback; omitted below 128 tokens, on prefix rewrite, or on a model/tool-set change) |
 | `prediction` | measured serving estimates: `latency_ms`, `output_tokens`, `interval_ms`, `remaining_calls`, `remaining_time_ms`, `next_action` | in-plugin observation engine (rolling p90); omitted until enough samples |
 | `strict_priority` | reserved for a trusted control plane | constructor injection only; ordinary agents never set it |
 
@@ -141,6 +144,10 @@ Key emission rules:
 - `epoch` bumps when the message prefix is rewritten (summarization signal).
 - Only requests flowing through `wrap_model_call` are hinted; auxiliary
   model calls that bypass the middleware chain are not.
+- `priority` and `cache_control` are derived from real run facts by default
+  (`"auto"`); pass an explicit `PriorityHint` / tuple to pin them, or `None`
+  to omit the field. `cache_control` is re-declared on every request (the
+  consumer never renews TTL).
 
 ## Status events
 

@@ -66,6 +66,22 @@ OpenAI-compatible gateway that the header rides both paths and is accepted
 - Aggregates are thread-safe and bounded (`max_samples`, default 256); the
   `persist_path` JSON carries them across process restarts.
 
+## Real-value derivation (v0.3.0)
+
+- `ModelRequest.messages` **excludes** the system message; the system prompt is
+  `request.system_message`. `range.end` therefore counts
+  `len(messages) + (1 if system_message else 0)`.
+- `priority` classification reads the last message's role: `HumanMessage` →
+  `3/user_waiting`; a tool result → `1/critical_path` (self-driven). The
+  approval-resume window is signalled by the status middleware through the
+  shared `RunSignals` (one-shot), because the resumed request's last message is
+  a tool result.
+- `cache_control` TTL samples the **most common next tool**'s last-20 p90
+  duration (per tool, not per call position — the guide's per-position
+  approximation), falling back to the measured inter-call gap.
+- A changed model/tool/system fingerprint suppresses the declaration for that
+  round (cache key invalidation), as does an epoch bump.
+
 ## Known limitations (v1)
 
 - **Same-name concurrent subagents collide** on the session id

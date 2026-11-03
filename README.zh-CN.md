@@ -72,7 +72,10 @@ result = agent.invoke(
   "session": {"session_id": "session-42", "agent_type": "my-agent", "call_index": 3, "epoch": 0},
   "agent_status": {"state": "running", "state_since_ms": 1730000000000},
   "priority": {"level": 3, "reason": "user_waiting"},
-  "cache_control": [{"type": "pin", "range": {"end": 1}}]
+  "cache_control": [
+    {"type": "ephemeral", "ttl_s": 240,
+     "range": {"end": 2, "unit": "message"}}
+  ]
 }
 ```
 
@@ -103,8 +106,8 @@ agent = create_deep_agent(
 | --- | --- | --- |
 | `session` | `session_id`、`agent_type`、`call_index`、`epoch`、可选 `parent_session_id` + `derivation` | `thread_id`、构造参数、持久化消息历史 |
 | `agent_status` | 请求时刻的生命周期快照（恒为 `running`） | 中间件观测 |
-| `priority` | 级别 + 审计原因（默认 `{level: 3, reason: user_waiting}`；子代理为 `critical_path`） | 构造参数 |
-| `cache_control` | 消息区间的 pin/ephemeral 缓存意图（默认：pin 系统提示词 `[0, 1)`） | 构造参数 |
+| `priority` | 级别 + 审计原因。自动：人类消息/审批恢复 → `3/user_waiting`；工具续接与子 Agent → `1/critical_path`；`run_mode="batch"` → `1/background` | 请求触发源 + 共享 `RunSignals`；显式 `PriorityHint` 可覆盖 |
+| `cache_control` | 单条 `ephemeral` + 显式 TTL（`clamp(gap×2, 60, 3600)`）；`range.end` = 逻辑输入条数（`[system?] + messages`） | 按 cache-control 指南逐请求推导（下一工具 p90 → 最近间隔 → 300s；<128 token、前缀重写、模型/工具集变化当轮不发） |
 | `prediction` | 实测服务预估：`latency_ms`、`output_tokens`、`interval_ms`、`remaining_calls`、`remaining_time_ms`、`next_action` | 插件内观测引擎（滚动 p90）；样本不足时省略 |
 | `strict_priority` | 保留给可信控制面 | 仅构造参数显式注入；普通 Agent 永不生成 |
 

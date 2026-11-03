@@ -67,12 +67,22 @@ JSON 编码丢弃 `null`/未设置字段：**"不适用"的编码方式就是省
 
 `{level: int, reason: string}`。级别遵循协议示例：`3` = 等待用户的交互型工作（`user_waiting`）；sync-join 的子代理位于父关键路径上（`critical_path`）。
 
-- `priority`——Agent 自身的服务优先级。级别在协议层折叠进二值域 `{1, 3}`（`3` = 用户介入/免准入，`1` = 其余；v1 遗留 `{2, 4}` 与越界值按准入线折叠，准入结果不变）。
+- `priority`——Agent 自身的服务优先级。级别在协议层折叠进二值域 `{1, 3}`（`3` = 用户介入/免准入，`1` = 其余；v1 遗留 `{2, 4}` 与越界值按准入线折叠，准入结果不变）。参考实现按请求触发源推导：人类消息/审批恢复 → `3/user_waiting`；工具续接或子 Agent → `1/critical_path`；批量运行 → `1/background`。组合显式配置仍优先。
 - `strict_priority`——**保留给可信控制面；普通 Agent 永不发射。** 仅当组合显式注入（构造参数）时才会序列化，绝不从 Agent 事实推导。
 
 ### 3.5 `cache_control`
 
-数组（或单对象）`{type: "pin" | "ephemeral", ttl_s?: int, range?: {start?: int, end?: int, unit?: "message" | "token"}}`，声明消息区间上的缓存意图。库默认 pin 系统提示词（区间 `[0, 1)`）——把组合本已保证的字节稳定前缀显式声明出来。
+实现 `CACHE_CONTROL_IMPLEMENTATION_GUIDE.md`，只带**一条**声明：
+
+```json
+{"type": "ephemeral", "ttl_s": 240, "range": {"end": 12, "unit": "message"}}
+```
+
+- `type`——只用 `ephemeral`（`pin` 已退役，消费方会归一化并告警）。
+- `ttl_s`——必填；`clamp(gap × 2, 60, 3600)`，`gap` 取下一工具预计耗时（p90），否则最近调用间隔，否则 300s 兜底。消费方不续期，故每请求都要重新声明。
+- `range.end`——**逻辑输入条数** `[system?] + messages`（1-based，含），绝不用 append-only 历史长度；`range.unit` 为 `message`。
+
+前缀不足一个 128-token 缓存块、消息前缀被重写（压缩/分支，epoch 递增）或模型/工具集变化的当轮都不发声明。
 
 ### 3.6 `prediction`（插件内实测）
 

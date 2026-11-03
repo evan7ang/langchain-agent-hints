@@ -113,8 +113,9 @@ DEFAULT_PRIORITY = PriorityHint(level=3, reason="user_waiting")
 #: example).
 DEFAULT_SUBAGENT_PRIORITY = PriorityHint(level=3, reason="critical_path")
 
-#: Pin the system prompt (message range [0, 1)): declare the intent that the
-#: composition keeps the prompt prefix byte-stable.
+#: Deprecated: the cache-control guide retires ``pin`` (consumers normalize it
+#: to ``ephemeral`` and warn). Kept for explicit opt-in compatibility only;
+#: the middleware derives a guide-compliant ``ephemeral`` declaration by default.
 DEFAULT_CACHE_CONTROL: tuple[CacheControlHint, ...] = (
     CacheControlHint(type="pin", range=CacheControlRange(end=1)),
 )

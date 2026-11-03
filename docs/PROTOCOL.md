@@ -88,18 +88,36 @@ sit on the parent's critical path (`critical_path`).
 - `priority` — the agent's own serving priority. Levels are folded into the
   contracted two-value domain `{1, 3}` at the protocol layer (`3` =
   user-intervened / admission-exempt, `1` = everything else; legacy `{2, 4}`
-  and out-of-range values fold without changing admission outcomes).
+  and out-of-range values fold without changing admission outcomes). The
+  reference implementation derives the value from the request trigger: a
+  human message or an approval resume is `3/user_waiting`; a tool-result
+  continuation or a subagent run is `1/critical_path`; batch runs are
+  `1/background`. Explicit composition values still win.
 - `strict_priority` — **reserved for a trusted control plane; ordinary agents
   never emit it.** It is only serialized when the composition injects it
   explicitly (constructor argument), never derived from agent facts.
 
 ### 3.5 `cache_control`
 
-Array (or single object) of `{type: "pin" | "ephemeral", ttl_s?: int,
-range?: {start?: int, end?: int, unit?: "message" | "token"}}`, declaring
-cache intent over message ranges. The library default pins the system prompt
-(range `[0, 1)`) — a declaration of the byte-stable-prefix guarantee a
-composition already makes.
+Implements `CACHE_CONTROL_IMPLEMENTATION_GUIDE.md`. The field carries **one**
+declaration:
+
+```json
+{"type": "ephemeral", "ttl_s": 240, "range": {"end": 12, "unit": "message"}}
+```
+
+- `type` — `ephemeral` only (`pin` is retired; consumers normalize it and warn).
+- `ttl_s` — mandatory; the harness computes `clamp(gap * 2, 60, 3600)` where
+  `gap` is the next-tool expected duration (p90), else the last inter-call
+  interval, else a 300 s fallback. The consumer never renews it, so every
+  request re-declares.
+- `range.end` — the **logical input count** `[system?] + messages` (1-based,
+  inclusive), never the append-only history length; `range.unit` is
+  `message`.
+
+The implementation omits the declaration when the prefix is below one engine
+cache block (128 tokens), when the message prefix was rewritten (compaction or
+branch: the epoch bump), or when the model/tool set changed that round.
 
 ### 3.6 `prediction` (measured in-process)
 
