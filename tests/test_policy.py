@@ -119,28 +119,42 @@ def test_priority_auto_classification() -> None:
         messages=[HumanMessage(content="go"), ToolMessage(content="ok", tool_call_id="c")]
     )
 
-    assert mw._resolve_priority(root, human) == PriorityHint(level=3, reason="user_waiting")
-    assert mw._resolve_priority(root, continuation) == PriorityHint(level=1, reason="critical_path")
-    assert mw._resolve_priority(child, human) == PriorityHint(level=1, reason="critical_path")
-
-    batch = AgentHintsMiddleware(agent_type="a", run_mode="batch")
-    assert batch._resolve_priority(root, human) == PriorityHint(level=1, reason="background")
-
-    # Approval resume: the shared signal upgrades the next call to user-waiting.
-    signals = RunSignals()
-    resumed = AgentHintsMiddleware(agent_type="a", signals=signals)
-    signals.observe_transition("t", "pause", "running", 42)
-    assert resumed._resolve_priority(root, continuation) == PriorityHint(
+    assert mw._resolve_priority(root, human, resumed=False) == PriorityHint(
         level=3, reason="user_waiting"
     )
-    assert resumed._resolve_priority(root, continuation) == PriorityHint(
+    assert mw._resolve_priority(root, continuation, resumed=False) == PriorityHint(
         level=1, reason="critical_path"
-    )  # one-shot
+    )
+    assert mw._resolve_priority(child, human, resumed=False) == PriorityHint(
+        level=1, reason="critical_path"
+    )
+
+    batch = AgentHintsMiddleware(agent_type="a", run_mode="batch")
+    assert batch._resolve_priority(root, human, resumed=False) == PriorityHint(
+        level=1, reason="background"
+    )
+
+    # Approval resume: the middleware consumes the one-shot signal and passes it
+    # to the priority resolver.
+    assert mw._resolve_priority(root, continuation, resumed=True) == PriorityHint(
+        level=3, reason="user_waiting"
+    )
+    assert mw._resolve_priority(root, continuation, resumed=False) == PriorityHint(
+        level=1, reason="critical_path"
+    )
+
+    # The shared RunSignals itself flags exactly one resume.
+    signals = RunSignals()
+    signals.observe_transition("t", "pause", "running", 42)
+    assert signals.take_resumed("t") is True
+    assert signals.take_resumed("t") is False
 
     # Explicit policy still wins; None omits the field.
     pinned = AgentHintsMiddleware(
         agent_type="a", priority=PriorityHint(level=1, reason="background")
     )
-    assert pinned._resolve_priority(root, human) == PriorityHint(level=1, reason="background")
+    assert pinned._resolve_priority(root, human, resumed=False) == PriorityHint(
+        level=1, reason="background"
+    )
     omitted = AgentHintsMiddleware(agent_type="a", priority=None)
-    assert omitted._resolve_priority(root, human) is None
+    assert omitted._resolve_priority(root, human, resumed=False) is None

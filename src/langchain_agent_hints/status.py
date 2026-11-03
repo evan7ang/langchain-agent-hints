@@ -57,13 +57,13 @@ import urllib.request
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage
 
 from langchain_agent_hints.middleware import resolve_session_identity
-from langchain_agent_hints.schema import AgentState, StatusTool
+from langchain_agent_hints.schema import AgentState, InternalAgentState, StatusTool
 from langchain_agent_hints.signals import RunSignals
 
 
@@ -203,10 +203,27 @@ def _status_tool_entries(tools: tuple[StatusTool, ...]) -> list[dict[str, Any]]:
 
 @dataclass(frozen=True)
 class _SessionState:
-    """Per-session in-process transition bookkeeping."""
+    """Per-session in-process transition bookkeeping (internal states)."""
 
-    last_state: AgentState | None = None
+    last_state: InternalAgentState | None = None
     outstanding_tools: int = 0
+
+
+def _wire_state(previous: InternalAgentState | None, state: InternalAgentState) -> AgentState:
+    """Fold internal states to the 4-value wire contract.
+
+    - ``tool`` -> ``running`` (tool execution is still "working");
+    - ``suspend`` -> ``pause`` (waiting longer is still "someone is waiting");
+    - leaving ``pause``/``suspend`` -> ``resume`` (the one-shot approval edge);
+    - ``running`` / ``pause`` / ``finalize`` pass through.
+    """
+    if previous in ("pause", "suspend") and state in ("running", "tool"):
+        return "resume"
+    if state == "tool":
+        return "running"
+    if state == "suspend":
+        return "pause"
+    return cast(AgentState, state)
 
 
 _UNSET = _SessionState()
@@ -258,7 +275,7 @@ class AgentStatusEventsMiddleware(AgentMiddleware):
     def _transition(
         self,
         session_id: str,
-        state: AgentState,
+        state: InternalAgentState,
         *,
         reason: str | None = None,
         tools: tuple[StatusTool, ...] | None = None,
@@ -293,7 +310,7 @@ class AgentStatusEventsMiddleware(AgentMiddleware):
         self._sink.send(
             status_event(
                 session_id,
-                state,
+                _wire_state(track.last_state, state),
                 reason=reason,
                 tools=tools,
                 prediction=prediction,
@@ -319,7 +336,7 @@ class AgentStatusEventsMiddleware(AgentMiddleware):
             self._signals.observe_transition(session_id, "pause", "suspend", self._clock())
             self._suspend_timers.pop(session_id, None)
         self._sink.send(
-            status_event(session_id, "suspend", reason="checkpoint", now_ms=self._clock())
+            status_event(session_id, "pause", reason="checkpoint", now_ms=self._clock())
         )
 
     @property
@@ -347,7 +364,7 @@ class AgentStatusEventsMiddleware(AgentMiddleware):
         self._sink.send(
             status_event(
                 session_id,
-                "tool",
+                _wire_state(track.last_state, "tool"),
                 reason=reason,
                 tools=(tool,),
                 now_ms=self._clock(),

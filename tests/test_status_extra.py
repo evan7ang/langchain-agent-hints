@@ -66,10 +66,15 @@ def test_subagent_delegation_reports_join_barrier(tmp_path: Path) -> None:
     agent.invoke({"messages": [("user", "go")]}, config={"configurable": {"thread_id": "t"}})
 
     events = read_status_events(sink_path, "t")
-    tool_events = [event for event in events if event["agent_status"]["state"] == "tool"]
+    # tool folds to running on the wire; the reason/tools stay on the event.
+    tool_events = [
+        event
+        for event in events
+        if event["agent_status"]["state"] == "running"
+        and event["agent_status"].get("reason") == "join_barrier"
+    ]
     assert len(tool_events) == 1
     status = tool_events[0]["agent_status"]
-    assert status["reason"] == "join_barrier"
     assert status["tools"] == [
         {
             "name": "agent:researcher",
@@ -124,14 +129,23 @@ def test_pause_carries_expected_resume_and_turns_into_suspend(
         status.close()
 
     events = read_status_events(sink_path, "a")
-    pause = [event for event in events if event["agent_status"]["state"] == "pause"]
+    pause = [
+        event
+        for event in events
+        if event["agent_status"]["state"] == "pause"
+        and event["agent_status"].get("reason") == "human_approval"
+    ]
     assert len(pause) == 1
-    assert pause[0]["agent_status"]["reason"] == "human_approval"
     assert pause[0]["prediction"] == {"expected_resume_s": 600}
 
-    suspend = [event for event in events if event["agent_status"]["state"] == "suspend"]
+    # suspend folds to pause on the wire; the checkpoint reason distinguishes it.
+    suspend = [
+        event
+        for event in events
+        if event["agent_status"]["state"] == "pause"
+        and event["agent_status"].get("reason") == "checkpoint"
+    ]
     assert len(suspend) == 1
-    assert suspend[0]["agent_status"]["reason"] == "checkpoint"
 
 
 def test_http_sink_posts_the_event(stub_server: tuple[str, Path]) -> None:

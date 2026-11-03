@@ -24,6 +24,7 @@ from dataclasses import dataclass
 @dataclass
 class _SessionSignal:
     state_since_ms: int | None = None
+    state: str | None = None
     resumed: bool = False
 
 
@@ -49,7 +50,8 @@ class RunSignals:
         with self._lock:
             signal = self._sessions.setdefault(session_id, _SessionSignal())
             signal.state_since_ms = now_ms
-            if previous == "pause" and state in ("running", "tool"):
+            signal.state = state
+            if previous in ("pause", "suspend") and state in ("running", "tool"):
                 signal.resumed = True
 
     def state_since_ms(self, session_id: str) -> int | None:
@@ -57,6 +59,12 @@ class RunSignals:
         with self._lock:
             signal = self._sessions.get(session_id)
             return signal.state_since_ms if signal is not None else None
+
+    def current_state(self, session_id: str) -> str | None:
+        """Current internal state (``tool``/``suspend`` included), or None."""
+        with self._lock:
+            signal = self._sessions.get(session_id)
+            return signal.state if signal is not None else None
 
     def take_resumed(self, session_id: str) -> bool:
         """Consume the one-shot approval-resume flag."""

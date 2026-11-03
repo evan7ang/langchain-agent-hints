@@ -126,3 +126,39 @@ def test_fork_is_not_emitted_by_this_harness(monkeypatch) -> None:
     mw = AgentHintsMiddleware(agent_type="a")
     wire = _wire(_Request([HumanMessage(content="go")]), mw)
     assert "derivation" not in wire["session"]
+
+
+def test_agent_status_header_has_only_state_and_since(monkeypatch) -> None:
+    """Doc §8-8: the header carries only state + state_since_ms."""
+    monkeypatch.setattr(middleware_mod, "ensure_config", lambda: _config(thread_id="t"))
+    mw = AgentHintsMiddleware(agent_type="a")
+    wire = _wire(_Request([HumanMessage(content="go")]), mw)
+    assert set(wire["agent_status"]) == {"state", "state_since_ms"}
+
+
+def test_in_band_resume_is_one_shot(monkeypatch) -> None:
+    """Doc §4.3/§8-4/5: the first request after approval is resume, then running."""
+    from langchain_agent_hints.signals import RunSignals
+
+    monkeypatch.setattr(middleware_mod, "ensure_config", lambda: _config(thread_id="r"))
+    signals = RunSignals()
+    mw = AgentHintsMiddleware(agent_type="a", signals=signals)
+    signals.observe_transition("r", "pause", "tool", 42)
+
+    first = _wire(_Request([HumanMessage(content="go")]), mw)
+    second = _wire(_Request([HumanMessage(content="go")]), mw)
+    assert first["agent_status"]["state"] == "resume"
+    assert first["priority"] == {"level": 3, "reason": "user_waiting"}
+    assert second["agent_status"]["state"] == "running"
+
+
+def test_in_band_pause_while_parked(monkeypatch) -> None:
+    """Doc §4.2: a request made while parked still reports pause."""
+    from langchain_agent_hints.signals import RunSignals
+
+    monkeypatch.setattr(middleware_mod, "ensure_config", lambda: _config(thread_id="p"))
+    signals = RunSignals()
+    mw = AgentHintsMiddleware(agent_type="a", signals=signals)
+    signals.observe_transition("p", "running", "pause", 10)
+    wire = _wire(_Request([HumanMessage(content="heartbeat")]), mw)
+    assert wire["agent_status"]["state"] == "pause"

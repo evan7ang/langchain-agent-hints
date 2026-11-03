@@ -98,7 +98,7 @@ def test_explicit_prediction_and_strict_priority_reach_the_wire() -> None:
             prediction=PredictionHint(
                 output_tokens=42,
                 next_action=NextActionHint(
-                    state="tool", tools=(PredictedTool(name="web_search"),), prob=0.8
+                    state="running", tools=(PredictedTool(name="web_search"),), prob=0.8
                 ),
             ),
             strict_priority=PriorityHint(level=3, reason="critical_path"),
@@ -106,7 +106,7 @@ def test_explicit_prediction_and_strict_priority_reach_the_wire() -> None:
     )
     assert wire["prediction"] == {
         "output_tokens": 42,
-        "next_action": {"state": "tool", "tools": [{"name": "web_search"}], "prob": 0.8},
+        "next_action": {"state": "running", "tools": [{"name": "web_search"}], "prob": 0.8},
     }
     assert wire["strict_priority"] == {"level": 3, "reason": "critical_path"}
 
