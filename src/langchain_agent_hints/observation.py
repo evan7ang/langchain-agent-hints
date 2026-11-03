@@ -78,6 +78,12 @@ class _Series:
     def values(self) -> list[float]:
         return list(self._values)
 
+    def recent(self, count: int) -> list[float]:
+        """The last ``count`` samples (oldest first)."""
+        if count <= 0:
+            return []
+        return list(self._values)[-count:]
+
     def load(self, values: list[float]) -> None:
         self._values = deque(values[-self._maxlen :], maxlen=self._maxlen)
 
@@ -266,6 +272,43 @@ class ObservationStore:
             self._flush_locked()
 
     # -- emission ------------------------------------------------------------
+
+    def last_interval_ms(self, session_id: str) -> int | None:
+        """Measured gap between the previous call's end and this call's start."""
+        if not self._options.enabled:
+            return None
+        with self._lock:
+            session = self._sessions.get(session_id)
+            return session.last_interval_ms if session is not None else None
+
+    def predicted_next_tool(self, agent_type: str) -> str | None:
+        """Most common next tool learned from model->tool transitions."""
+        if not self._options.enabled:
+            return None
+        with self._lock:
+            stats = self._types.get(agent_type)
+            if stats is None or not stats.next_tool_counts:
+                return None
+            return max(stats.next_tool_counts, key=stats.next_tool_counts.__getitem__)
+
+    def tool_expected_s(self, agent_type: str, tool_name: str | None) -> float | None:
+        """p90 of the tool's last 20 durations in seconds; None below 3 samples.
+
+        The cache-control guide groups samples by ``(call position, tool)``;
+        this implementation groups by tool only (a documented approximation —
+        the same tool at different positions shares its window).
+        """
+        if not self._options.enabled or not tool_name:
+            return None
+        with self._lock:
+            stats = self._types.get(agent_type)
+            series = None if stats is None else stats.tool_duration_ms.get(tool_name)
+            if series is None:
+                return None
+            recent = series.recent(20)
+        if len(recent) < 3:
+            return None
+        return percentile(recent, self._options.quantile) / 1000.0
 
     def prediction(
         self,

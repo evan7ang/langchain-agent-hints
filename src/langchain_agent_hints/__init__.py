@@ -17,6 +17,15 @@ from langchain_agent_hints.middleware import (
     resolve_session_identity,
 )
 from langchain_agent_hints.observation import ObservationOptions, ObservationStore
+from langchain_agent_hints.policy import (
+    MIN_CACHE_TOKENS,
+    TTL_MAX_S,
+    TTL_MIN_S,
+    build_cache_control,
+    estimate_tokens,
+    estimate_ttl_s,
+    logical_message_count,
+)
 from langchain_agent_hints.schema import (
     DEFAULT_CACHE_CONTROL,
     DEFAULT_PRIORITY,
@@ -41,6 +50,7 @@ from langchain_agent_hints.schema import (
     hint_to_dict,
     normalize_priority_level,
 )
+from langchain_agent_hints.signals import RunSignals
 from langchain_agent_hints.status import (
     AgentStatusEventsMiddleware,
     HttpStatusEventSink,
@@ -49,7 +59,7 @@ from langchain_agent_hints.status import (
     status_event,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "HINT_HEADER",
@@ -72,6 +82,14 @@ __all__ = [
     "ObservationOptions",
     "ObservationStore",
     "PredictedTool",
+    "RunSignals",
+    "MIN_CACHE_TOKENS",
+    "TTL_MAX_S",
+    "TTL_MIN_S",
+    "build_cache_control",
+    "estimate_ttl_s",
+    "estimate_tokens",
+    "logical_message_count",
     "PredictionHint",
     "PriorityHint",
     "SessionHint",
