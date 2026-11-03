@@ -128,7 +128,7 @@ gateway via `OPENAI_BASE_URL`.
 | Block | Content | Source |
 | --- | --- | --- |
 | `session` | `session_id`, `agent_type`, `call_index`, `epoch`, optional `parent_session_id` + `derivation` | `thread_id`, constructor options, persistent message history |
-| `agent_status` | request-time lifecycle snapshot (always `running`) | middleware observation |
+| `agent_status` | wire snapshot: `running` by default, `resume` on the first request after an approval, `pause` if a request occurs while parked | middleware observation + shared `RunSignals` |
 | `priority` | level + audit reason. Auto: human message / approval resume → `3/user_waiting`; tool continuation and subagent runs → `1/critical_path`; `run_mode="batch"` → `1/background` | request trigger + shared `RunSignals`; explicit `PriorityHint` overrides |
 | `cache_control` | one `ephemeral` declaration with an explicit TTL (`clamp(gap*2, 60, 3600)`); `range.end` = logical input count (`[system?] + messages`) | per-request derivation from the cache-control guide (next-tool p90 → last interval → 300 s fallback; omitted below 128 tokens, on prefix rewrite, or on a model/tool-set change) |
 | `prediction` | measured serving estimates: `latency_ms`, `output_tokens`, `interval_ms`, `remaining_calls`, `remaining_time_ms`, `next_action` | in-plugin observation engine (rolling p90); omitted until enough samples |
@@ -154,13 +154,19 @@ Key emission rules:
 `AgentStatusEventsMiddleware` reports transitions as they happen, in protocol
 shape `{"seq": N, "session": {...}, "agent_status": {...}}`:
 
-| Hook | Event | Dedup |
+Wire states follow `AGENT_STATUS_STATE_DESIGN.md` v1.0: **four values**
+(`running` / `pause` / `resume` / `finalize`). Internal `tool` folds into
+`running` (the reason/tools stay on the event) and `suspend` folds into
+`pause`; `resume` is the one-shot approval edge.
+
+| Hook | Event (wire state) | Dedup |
 | --- | --- | --- |
 | `wrap_model_call` entry | `running` | only if last state ≠ running |
-| `wrap_model_call` response | `pause` (`human_approval`, gated tools listed) | every gated response |
-| `after_model` | `running` | only if last state ≠ running |
-| `wrap_tool_call` entry | `tool` (`await_tool`, name + call_id) | every tool call |
+| model response with gated tools | `pause` (`human_approval`, gated tools listed) | every gated response |
+| approval resume | `resume` (one-shot; the next header also reports `resume`) | once per resume |
+| `wrap_tool_call` entry | `running` (`reason: await_tool`/`join_barrier`, tools listed) | every tool call |
 | `wrap_tool_call` exit | `running` | only when the last outstanding tool finishes |
+| suspend threshold (`suspend_after_s`) | `pause` (`reason: checkpoint`) | once while parked |
 | `after_agent` | `finalize` | fires only on real completion (an approval pause suspends without finalize) |
 
 With `subagent_tools={"task"}` (the default) a delegation call is reported as

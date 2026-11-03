@@ -59,7 +59,7 @@ from langchain_agent_hints.status import (
     status_event,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "HINT_HEADER",

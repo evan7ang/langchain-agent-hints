@@ -74,10 +74,10 @@ applicable"** (e.g. root sessions carry no `parent_session_id`).
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `state` | `running` \| `tool` \| `pause` \| `suspend` \| `finalize` | Lifecycle state snapshot. On the in-band hint this is always `running` (a request exists only while the agent generates). |
-| `state_since_ms` | epoch ms | Instant the current state began. On the hint: the instant the previous tool result landed (wall clock at request preparation as the fallback). |
-| `reason` | string | Optional reason code (see §4 events). |
-| `tools` | array | Optional `[{name, call_id?, child_session_id?}]` — what a `tool`-state agent is waiting on. |
+| `state` | `running` \| `pause` \| `resume` \| `finalize` | Wire lifecycle snapshot (4 values, `AGENT_STATUS_STATE_DESIGN.md` v1.0). Internal `tool` folds to `running` and `suspend` folds to `pause` at the harness boundary; `resume` marks the first request after an approval pause (one-shot). |
+| `state_since_ms` | epoch ms | Instant the current state began. On the hint: the tracked transition instant (request wall clock as the fallback). |
+| `reason` | string | **Event channel only** — not emitted in the request header. |
+| `tools` | array | **Event channel only** — `[{name, call_id?, child_session_id?}]` on the out-of-band event. |
 
 ### 3.4 `priority` / `strict_priority`
 
@@ -148,19 +148,20 @@ per-field overrides supplied to the middleware win over measured values.
 ## 5. Out-of-band status events
 
 Event shape: `{"seq": N, "session": {"session_id": ...}, "agent_status":
-{state, state_since_ms, reason?, tools?}}` (§3.3 field semantics; `state` here
-takes all lifecycle values).
+{state, state_since_ms, reason?, tools?}}` (§3.3 field semantics; `state` is
+the same 4-value wire set; `reason`/`tools` are event-only).
 
-Transition rules:
+Transition rules (wire states; internal `tool`/`suspend` are folded):
 
 | Transition | Emitted when |
 | --- | --- |
-| `running` | A model request starts (also: a reject/respond resume re-enters the model directly). Repeats are suppressed — every model call and tool completion would otherwise re-report it. |
+| `running` | A model request starts. Repeats are suppressed — every model call and tool completion would otherwise re-report it. |
+| `running` (`reason: await_tool`, `tools`) | A tool call begins (internal `tool` folds to `running`; the tool name/call_id stay on the event). |
+| `running` (`reason: join_barrier`, `tools`) | A delegation tool (deepagents `task`) starts; `tools` names the child (`agent:<type>`) and carries `child_session_id`. |
+| `running` (from a tool) | The session's **last** outstanding tool completes (parallel batches report running only after the last result). |
 | `pause` (`reason: human_approval`) | A model response contains a tool call gated for human approval, just before the suspension begins. |
-| `tool` (`reason: await_tool`) | A tool call begins; `tools` lists `{name, call_id}`. |
-| `running` (from `tool`) | The session's **last** outstanding tool completes (parallel tool batches report running only after the last result). |
-| `tool` (`reason: join_barrier`) | A delegation tool (deepagents `task`) starts; `tools` names the child (`agent:<type>`) and carries `child_session_id`. The parent blocks until the child returns. |
-| `suspend` (`reason: checkpoint`) | An approval pause outlives the configured `suspend_after_s` threshold (optional; off by default). |
+| `pause` (`reason: checkpoint`) | An approval pause outlives `suspend_after_s` (optional; off by default; internal `suspend` folds to `pause`). |
+| `resume` | The transition out of `pause`/`suspend` — the one-shot approval edge. The next request header also reports `resume`. |
 | `finalize` | The graph run actually completes. An approval pause suspends mid-run without finalize; the resumed run finalizes exactly once. |
 
 A `pause` event may carry an estimate block: `"prediction":

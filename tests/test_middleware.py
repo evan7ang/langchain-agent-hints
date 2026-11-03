@@ -94,7 +94,7 @@ def test_two_calls_hinted_with_state_derived_call_index(tmp_path: Path) -> None:
 
     # The full status lifecycle of the plain round rode along.
     states = [e["agent_status"]["state"] for e in read_status_events(sink_path, "t1")]
-    assert states == ["running", "tool", "running", "finalize"]
+    assert states == ["running", "running", "running", "finalize"]
 
 
 def test_no_thread_id_degrades_to_no_hint_no_events(tmp_path: Path) -> None:
@@ -135,7 +135,7 @@ def test_async_path_hints_identically(tmp_path: Path) -> None:
     assert [h["session"]["call_index"] for h in hints] == [1, 2]
     assert hints[0]["session"]["session_id"] == "t-async"
     states = [e["agent_status"]["state"] for e in read_status_events(sink_path, "t-async")]
-    assert states == ["running", "tool", "running", "finalize"]
+    assert states == ["running", "running", "running", "finalize"]
 
 
 def test_epoch_bumps_on_prefix_rewrite() -> None:

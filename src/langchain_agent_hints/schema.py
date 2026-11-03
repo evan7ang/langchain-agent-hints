@@ -29,7 +29,14 @@ HINT_HEADER = "X-Agent-Hint"
 
 #: Lifecycle states shared by ``agent_status.state`` and
 #: ``prediction.next_action.state``.
-AgentState = Literal["running", "tool", "pause", "suspend", "finalize"]
+#: Wire value set (AGENT_STATUS_STATE_DESIGN.md v1.0): ``tool`` and ``suspend``
+#: are folded at the harness boundary, and ``resume`` marks the first request
+#: after an approval pause.
+AgentState = Literal["running", "pause", "resume", "finalize"]
+
+#: Internal harness states before the wire fold (``tool`` -> running,
+#: ``suspend`` -> pause). Used by the status middleware only.
+InternalAgentState = Literal["running", "tool", "pause", "suspend", "finalize"]
 
 DerivationRelation = Literal["fork", "spawn", "handoff"]
 DerivationJoin = Literal["sync", "async"]
@@ -251,6 +258,7 @@ def build_agent_hint(
     *,
     prediction: PredictionHint | None = None,
     strict_priority: PriorityHint | None = None,
+    state: AgentState = "running",
 ) -> AgentHint:
     """Build one AgentHint for a main-line model request.
 
@@ -290,7 +298,7 @@ def build_agent_hint(
             derivation=derivation,
         ),
         agent_status=AgentStatus(
-            state="running",
+            state=state,
             state_since_ms=facts.state_since_ms if facts.state_since_ms is not None else now_ms,
         ),
         priority=_fold_priority(options.priority),

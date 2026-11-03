@@ -79,6 +79,7 @@ from langchain_agent_hints.policy import (
 )
 from langchain_agent_hints.schema import (
     HINT_HEADER,
+    AgentState,
     CacheControlHint,
     DerivationJoin,
     DerivationRelation,
@@ -383,13 +384,15 @@ class AgentHintsMiddleware(AgentMiddleware):
             track.prefix_key = key
             return previous is not None and previous != key
 
-    def _resolve_priority(self, identity: SessionIdentity, request: Any) -> PriorityHint | None:
+    def _resolve_priority(
+        self, identity: SessionIdentity, request: Any, *, resumed: bool
+    ) -> PriorityHint | None:
         policy = self._subagent_priority_policy if identity.is_subagent else self._priority_policy
         if policy is None:
             return None
         if not isinstance(policy, str):  # explicit PriorityHint
             return policy
-        if self._signals.take_resumed(identity.session_id):
+        if resumed:
             return PriorityHint(level=3, reason="user_waiting")
         if self._run_mode == "batch":
             return PriorityHint(level=1, reason="background")
@@ -462,7 +465,17 @@ class AgentHintsMiddleware(AgentMiddleware):
             identity.session_id, agent_type, call_index=call_index, now_ms=now_ms
         )
         prediction = _merge_prediction(measured, self._configured_prediction)
-        priority = self._resolve_priority(identity, request)
+        resumed = self._signals.take_resumed(identity.session_id)
+        priority = self._resolve_priority(identity, request, resumed=resumed)
+        current = self._signals.current_state(identity.session_id)
+        status_state: AgentState
+        if resumed:
+            status_state = "resume"
+        elif current in ("pause", "suspend"):
+            # A request made while the agent is parked still reports the wait.
+            status_state = "pause"
+        else:
+            status_state = "running"
         epoch, rewritten = self._take_epoch_slot(
             identity.session_id, _fingerprint(request.messages)
         )
@@ -492,6 +505,7 @@ class AgentHintsMiddleware(AgentMiddleware):
             now_ms=now_ms,
             prediction=prediction,
             strict_priority=self._strict_priority,
+            state=status_state,
         )
 
         model_settings = dict(request.model_settings)

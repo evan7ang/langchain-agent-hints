@@ -77,7 +77,7 @@ def test_measured_prediction_appears_after_enough_sessions() -> None:
     assert prediction["latency_ms"] is not None
     assert prediction["output_tokens"] == 60
     assert prediction["remaining_calls"] == 1
-    assert prediction["next_action"]["state"] == "tool"
+    assert prediction["next_action"]["state"] == "running"
     assert prediction["next_action"]["tools"] == [{"name": "web_search"}]
     assert prediction["next_action"]["prob"] == 0.5
 

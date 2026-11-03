@@ -66,6 +66,15 @@ OpenAI-compatible gateway that the header rides both paths and is accepted
 - Aggregates are thread-safe and bounded (`max_samples`, default 256); the
   `persist_path` JSON carries them across process restarts.
 
+## Wire state contract (v0.4.0)
+
+`agent_status.state` follows `AGENT_STATUS_STATE_DESIGN.md` v1.0: four values
+(`running` / `pause` / `resume` / `finalize`). Internal `tool` folds to
+`running` (the event keeps `reason`/`tools`) and `suspend` folds to `pause`
+(`reason: checkpoint`). The request header carries only `state` and
+`state_since_ms`; reason/tools are event-channel fields. `resume` is emitted
+once on the first request (and event) after an approval pause.
+
 ## Real-value derivation (v0.3.0)
 
 - `ModelRequest.messages` **excludes** the system message; the system prompt is

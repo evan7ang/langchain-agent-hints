@@ -113,9 +113,9 @@ def test_gated_round_pauses_without_finalize_then_resumes(tmp_path: Path) -> Non
     assert _states(read_status_events(sink_path, "gate-1")) == [
         "running",
         "pause",
-        "running",
-        "tool",
-        "running",
+        "resume",  # approval resume edge (one-shot)
+        "running",  # tool wait (folded)
+        "running",  # tool completion
         "finalize",
     ]
     # Per-session ordering: the sink's seq counter is contiguous.
@@ -132,9 +132,9 @@ def test_ungated_tool_never_pauses(tmp_path: Path) -> None:
     )
     assert "__interrupt__" not in result
     assert _states(read_status_events(sink_path, "ungated")) == [
-        "running",
-        "tool",
-        "running",
+        "running",  # model call
+        "running",  # tool wait (folded: tool -> running, reason await_tool)
+        "running",  # tool completion
         "finalize",
     ]
 
@@ -165,8 +165,8 @@ def test_async_gated_round_matches_sync_semantics(tmp_path: Path) -> None:
     assert _states(read_status_events(sink_path, "gate-a")) == [
         "running",
         "pause",
+        "resume",
         "running",
-        "tool",
         "running",
         "finalize",
     ]
