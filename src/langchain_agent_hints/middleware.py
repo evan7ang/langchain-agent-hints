@@ -100,9 +100,7 @@ AUTO = "auto"
 #: Context flag for auxiliary model calls (compaction summaries, titles, ...).
 #: The RFC requires them to carry no hint and no lifecycle transition; an outer
 #: middleware sets this around its auxiliary handler call.
-_SUPPRESS_HINT: ContextVar[bool] = ContextVar(
-    "langchain_agent_hints_suppress", default=False
-)
+_SUPPRESS_HINT: ContextVar[bool] = ContextVar("langchain_agent_hints_suppress", default=False)
 
 
 def hint_suppressed() -> bool:
