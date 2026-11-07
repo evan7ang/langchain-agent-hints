@@ -14,7 +14,9 @@ from __future__ import annotations
 from langchain_agent_hints.middleware import (
     AgentHintsMiddleware,
     SessionIdentity,
+    hint_suppressed,
     resolve_session_identity,
+    suppress_hints,
 )
 from langchain_agent_hints.observation import ObservationOptions, ObservationStore
 from langchain_agent_hints.policy import (
@@ -98,6 +100,8 @@ __all__ = [
     "StatusTool",
     "build_agent_hint",
     "decode_agent_hint",
+    "hint_suppressed",
+    "suppress_hints",
     "encode_agent_hint",
     "hint_to_dict",
     "normalize_priority_level",

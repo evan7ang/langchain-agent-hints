@@ -9,7 +9,7 @@
 
 **面向 LangChain Agent 的按请求服务意图提示，以中间件形式提供。**
 
-`langchain-agent-hints` 让你的 Agent 向下游推理层"播报自己当前的运行方式"。每次主链模型请求都会附带一个 **AgentHint** 对象——会话身份、生命周期状态、优先级、缓存控制——以 base64url 编码的 `X-Agent-Hint` HTTP 头发出；同时通过带外事件 sink 上报状态**转换**（`tool` / `running` / `pause` / `finalize`）。服务端（网关、路由、推理引擎）消费这些信号用于调度：会话感知的 KV-cache 放置、优先级调度、审批挂起降级等。
+`langchain-agent-hints` 让你的 Agent 向下游推理层"播报自己当前的运行方式"。每次主链模型请求都会附带一个 **AgentHint** 对象——会话身份、生命周期状态、优先级、缓存控制——以 base64url 编码的 `X-Agent-Hint` HTTP 头发出；同时通过带外事件 sink 上报状态**转换**（`running` / `pause` / `resume` / `finalize`）。服务端（网关、路由、推理引擎）消费这些信号用于调度：会话感知的 KV-cache 放置、优先级调度、审批挂起降级等。
 
 **Agent 发信号，引擎做决策。** 该中间件对模型可见的请求是只读的：从不改动 messages 或 system prompt——只向 `ModelRequest.model_settings` 扩展传输头，经 OpenAI 兼容 chat 模型表现为按请求的 `extra_headers`。
 
@@ -105,8 +105,8 @@ agent = create_deep_agent(
 | 块 | 内容 | 来源 |
 | --- | --- | --- |
 | `session` | `session_id`、`agent_type`、`call_index`、`epoch`、可选 `parent_session_id` + `derivation` | `thread_id`、构造参数、持久化消息历史 |
-| `agent_status` | 请求时刻的生命周期快照（恒为 `running`） | 中间件观测 |
-| `priority` | 级别 + 审计原因。自动：人类消息/审批恢复 → `3/user_waiting`；工具续接与子 Agent → `1/critical_path`；`run_mode="batch"` → `1/background` | 请求触发源 + 共享 `RunSignals`；显式 `PriorityHint` 可覆盖 |
+| `agent_status` | 请求时刻的生命周期快照：默认 `running`；停驻（含工具等待）为 `pause`；放行首条为 `resume` | 中间件观测 + 共享 `RunSignals` |
+| `priority` | 级别 + 审计原因。只有 `user_waiting` 是 3；`critical_path`/`background` 是 1。自动：人类消息/审批恢复 → `3/user_waiting`；工具续接/子 Agent → `1/critical_path`；`run_mode="batch"` → `1/background` | 请求触发源 + 共享 `RunSignals`；显式/服务值按 reason 归一 |
 | `cache_control` | 单条 `ephemeral` + 显式 TTL（`clamp(gap×2, 60, 3600)`）；`range.end` = 逻辑输入条数（`[system?] + messages`） | 按 cache-control 指南逐请求推导（下一工具 p90 → 最近间隔 → 300s；<128 token、前缀重写、模型/工具集变化当轮不发） |
 | `prediction` | 实测服务预估：`latency_ms`、`output_tokens`、`interval_ms`、`remaining_calls`、`remaining_time_ms`、`next_action` | 插件内观测引擎（滚动 p90）；样本不足时省略 |
 | `strict_priority` | 保留给可信控制面 | 仅构造参数显式注入；普通 Agent 永不生成 |
@@ -116,9 +116,9 @@ agent = create_deep_agent(
 关键发射规则：
 
 - 无 `thread_id` → 不发 hint、不发状态事件（身份必传）。
-- `call_index` 由检查点器持久化的消息历史派生（`1 + count(AIMessage)`），零状态即可在进程重启后存活。
+- `call_index` 是会话级高水位计数：首次从检查点消息历史播种（`1 + count(AIMessage)`），之后每次 hint 请求 +1；压缩重写不回退。
 - `epoch` 在消息前缀被重写时递增（summarization 信号）。
-- 只有流经 `wrap_model_call` 的请求携带 hint；旁路模型调用（不经中间件链）不会发射。
+- 只有流经 `wrap_model_call` 的请求携带 hint；旁路模型调用（不经中间件链）不会发射。若辅助调用（如压缩摘要）确实流经中间件链，用 `suppress_hints()` 包住：不发 header、不发状态转换。
 
 ## 状态事件
 
@@ -129,12 +129,12 @@ agent = create_deep_agent(
 | --- | --- | --- |
 | `wrap_model_call` 入口 | `running` | 仅当上一状态 ≠ running |
 | `wrap_model_call` 响应 | `pause`（`human_approval`，列出被门控的工具） | 每个门控响应都发 |
-| `after_model` | `running` | 仅当上一状态 ≠ running |
-| `wrap_tool_call` 入口 | `tool`（`await_tool`，name + call_id） | 每次工具调用 |
-| `wrap_tool_call` 退出 | `running` | 仅当会话最后一个在途工具结束 |
+| 审批/工具放行 | `resume`（一次性；下一条 header 也报 `resume`） | 每次放行一次 |
+| `wrap_tool_call` 入口 | `pause`（`await_tool`/`join_barrier`，name + call_id） | 每次工具调用 |
+| `wrap_tool_call` 退出 | `resume` | 仅当会话最后一个在途工具结束 |
 | `after_agent` | `finalize` | 仅在真正完成时触发（审批挂起不触发 finalize） |
 
-传入 `interrupt_tools=INTERRUPT_ON.keys()`（人工审批门控的工具名），被门控的工具调用就会以 `pause` 事件呈现。`subagent_tools={"task"}`（默认）把委派调用上报为 `tool` + `reason="join_barrier"`，带子 Agent 名（`agent:<type>`）与 `child_session_id`；`suspend_after_s=N` 在审批挂起超时后上报 `suspend`（`checkpoint`）；`expected_resume_s=N` 把等待估计挂到 pause 事件的 `prediction`。sink 实现单方法 `StatusEventSink` 协议；`JsonlStatusEventSink` 落盘 JSONL，`HttpStatusEventSink` POST 到网关端点（均按会话序列号排序、瞬时失败重试后丢弃）。sink 接口是同步的——异步钩子内联调用它，慢传输请使用带缓冲的 sink。
+传入 `interrupt_tools=INTERRUPT_ON.keys()`（人工审批门控的工具名），被门控的工具调用就会以 `pause` 事件呈现。`subagent_tools={"task"}`（默认）把委派调用上报为 `pause` + `reason="join_barrier"`，带子 Agent 名（`agent:<type>`）与 `child_session_id`；`suspend_after_s=N` 在审批挂起超时后上报 `suspend`（`checkpoint`）；`expected_resume_s=N` 把等待估计挂到 pause 事件的 `prediction`。sink 实现单方法 `StatusEventSink` 协议；`JsonlStatusEventSink` 落盘 JSONL，`HttpStatusEventSink` POST 到网关端点（均按会话序列号排序、瞬时失败重试后丢弃）。sink 接口是同步的——异步钩子内联调用它，慢传输请使用带缓冲的 sink。
 
 ## 服务预估（`prediction`）
 

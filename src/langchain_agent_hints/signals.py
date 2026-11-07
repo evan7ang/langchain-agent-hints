@@ -44,14 +44,18 @@ class RunSignals:
     ) -> None:
         """Record one lifecycle transition (called by the status middleware).
 
-        A transition out of ``pause`` into ``running``/``tool`` is an approval
-        resume window: the next hint reports user-intervened priority.
+        A transition out of ``pause``/``suspend``/``tool`` into ``running`` is
+        a one-shot release window: the next hint reports ``resume`` (and, for
+        an approval, user-intervened priority).
         """
         with self._lock:
             signal = self._sessions.setdefault(session_id, _SessionSignal())
             signal.state_since_ms = now_ms
             signal.state = state
-            if previous in ("pause", "suspend") and state in ("running", "tool"):
+            released_from_wait = (
+                previous in ("pause", "suspend") and state in ("running", "tool")
+            ) or (previous == "tool" and state == "running")
+            if released_from_wait:
                 signal.resumed = True
 
     def state_since_ms(self, session_id: str) -> int | None:

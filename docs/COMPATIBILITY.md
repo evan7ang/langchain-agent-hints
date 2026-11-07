@@ -69,11 +69,12 @@ OpenAI-compatible gateway that the header rides both paths and is accepted
 ## Wire state contract (v0.4.0)
 
 `agent_status.state` follows `AGENT_STATUS_STATE_DESIGN.md` v1.0: four values
-(`running` / `pause` / `resume` / `finalize`). Internal `tool` folds to
-`running` (the event keeps `reason`/`tools`) and `suspend` folds to `pause`
-(`reason: checkpoint`). The request header carries only `state` and
+(`running` / `pause` / `resume` / `finalize`). Internal `tool` and `suspend`
+fold to `pause` (tool events keep `reason`/`tools`; `suspend` uses
+`reason: checkpoint`). The request header carries only `state` and
 `state_since_ms`; reason/tools are event-channel fields. `resume` is emitted
-once on the first request (and event) after an approval pause.
+once on the first request (and event) after a release — an approval pause or a
+tool wait.
 
 ## Real-value derivation (v0.3.0)
 
@@ -99,8 +100,10 @@ once on the first request (and event) after an approval pause.
 - **`epoch` is a heuristic**: it detects context rewrites via the message
   prefix fingerprint (count + first-message hash). A rewrite that preserves
   both is not detected.
-- **`call_index` can dip** after a summarization rewrite compacts past
-  AIMessages away; the concurrent `epoch` bump signals the rewrite.
+- **`call_index` restart seed** is the persistent message history; if a
+  summarization rewrite compacted past AIMessages before a process restart, the
+  first post-restart seed can be lower than the pre-restart high-water mark
+  (the in-process counter itself never rewinds).
 - **False-positive `pause`** is possible when an interrupt config uses a
   `when` predicate that declines the interrupt after the response already
   passed the static gate-name check (the library checks names only).

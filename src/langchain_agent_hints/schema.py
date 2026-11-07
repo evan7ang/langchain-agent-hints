@@ -153,10 +153,31 @@ def normalize_priority_level(level: int) -> int:
     return 3 if level >= 3 else 1
 
 
+_PRIORITY_REASONS = ("user_waiting", "critical_path", "background")
+
+
 def _fold_priority(priority: PriorityHint | None) -> PriorityHint | None:
-    """Return the priority with its level folded into the contracted domain."""
+    """Return the priority folded to the contracted domain.
+
+    Simplified contract: only ``user_waiting`` is level 3; every other reason
+    is level 1. Audit reasons may carry a suffix (e.g.
+    ``background: context_compaction``); the wire reason is the base word. A
+    bare level still folds by the admission line so legacy callers keep their
+    admission outcome.
+    """
     if priority is None:
         return None
+    raw_reason = str(priority.reason or "").strip()
+    reason = raw_reason
+    for known in _PRIORITY_REASONS:
+        if raw_reason.startswith(known):
+            reason = known
+            break
+    if reason:
+        level = 3 if reason == "user_waiting" else 1
+        if level == priority.level and reason == priority.reason:
+            return priority
+        return PriorityHint(level=level, reason=reason)
     level = normalize_priority_level(priority.level)
     if level == priority.level:
         return priority
@@ -251,6 +272,16 @@ def _drop_none(value: Any) -> Any:
     return value
 
 
+def _fold_strict_priority(priority: PriorityHint | None) -> PriorityHint | None:
+    """Control-plane ``strict_priority``: fold the level only, never the reason."""
+    if priority is None:
+        return None
+    level = normalize_priority_level(priority.level)
+    if level == priority.level:
+        return priority
+    return PriorityHint(level=level, reason=priority.reason)
+
+
 def build_agent_hint(
     facts: HintRequestFacts,
     options: HintOptions,
@@ -302,7 +333,7 @@ def build_agent_hint(
             state_since_ms=facts.state_since_ms if facts.state_since_ms is not None else now_ms,
         ),
         priority=_fold_priority(options.priority),
-        strict_priority=_fold_priority(strict_priority),
+        strict_priority=_fold_strict_priority(strict_priority),
         cache_control=options.cache_control,
         prediction=prediction,
     )

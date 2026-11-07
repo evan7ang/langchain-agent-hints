@@ -13,7 +13,7 @@
 downstream inference layer. On every main-line model request it attaches an
 **AgentHint** object — session identity, lifecycle state, priority, cache
 control — as the base64url-encoded `X-Agent-Hint` HTTP header, and reports
-state *transitions* (`tool` / `running` / `pause` / `finalize`) through an
+state *transitions* (`running` / `pause` / `resume` / `finalize`) through an
 out-of-band event sink. The serving side (gateway, router, inference engine)
 consumes these signals for scheduling: session-aware KV-cache placement,
 priority scheduling, approval-pending demotion, and so on.
@@ -128,8 +128,8 @@ gateway via `OPENAI_BASE_URL`.
 | Block | Content | Source |
 | --- | --- | --- |
 | `session` | `session_id`, `agent_type`, `call_index`, `epoch`, optional `parent_session_id` + `derivation` | `thread_id`, constructor options, persistent message history |
-| `agent_status` | wire snapshot: `running` by default, `resume` on the first request after an approval, `pause` if a request occurs while parked | middleware observation + shared `RunSignals` |
-| `priority` | level + audit reason. Auto: human message / approval resume → `3/user_waiting`; tool continuation and subagent runs → `1/critical_path`; `run_mode="batch"` → `1/background` | request trigger + shared `RunSignals`; explicit `PriorityHint` overrides |
+| `agent_status` | wire snapshot: `running` by default, `pause` while parked (including a tool wait), `resume` on the first request after a release | middleware observation + shared `RunSignals` |
+| `priority` | level + audit reason. Only `user_waiting` is 3; `critical_path`/`background` are 1. Auto: human message / approval resume → `3/user_waiting`; tool continuation/subagent → `1/critical_path`; `run_mode="batch"` → `1/background` | request trigger + shared `RunSignals`; explicit/service values normalized by reason |
 | `cache_control` | one `ephemeral` declaration with an explicit TTL (`clamp(gap*2, 60, 3600)`); `range.end` = logical input count (`[system?] + messages`) | per-request derivation from the cache-control guide (next-tool p90 → last interval → 300 s fallback; omitted below 128 tokens, on prefix rewrite, or on a model/tool-set change) |
 | `prediction` | measured serving estimates: `latency_ms`, `output_tokens`, `interval_ms`, `remaining_calls`, `remaining_time_ms`, `next_action` | in-plugin observation engine (rolling p90); omitted until enough samples |
 | `strict_priority` | reserved for a trusted control plane | constructor injection only; ordinary agents never set it |
@@ -139,11 +139,13 @@ Full wire contract: [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 Key emission rules:
 
 - No `thread_id` → no hint, no status events (identity is mandatory).
-- `call_index` is derived from the checkpointer-persisted message history
-  (`1 + count(AIMessage)`), so it survives process restarts with zero state.
+- `call_index` is a session high-water counter seeded from the checkpointer-persisted message history
+  (`1 + count(AIMessage)`); a compaction rewrite does not rewind it.
 - `epoch` bumps when the message prefix is rewritten (summarization signal).
 - Only requests flowing through `wrap_model_call` are hinted; auxiliary
-  model calls that bypass the middleware chain are not.
+  model calls that bypass the middleware chain are not. For an auxiliary call
+  that does flow through the chain (e.g. a compaction summary), wrap it in
+  `suppress_hints()`: no header and no status transition.
 - `priority` and `cache_control` are derived from real run facts by default
   (`"auto"`); pass an explicit `PriorityHint` / tuple to pin them, or `None`
   to omit the field. `cache_control` is re-declared on every request (the
@@ -155,17 +157,17 @@ Key emission rules:
 shape `{"seq": N, "session": {...}, "agent_status": {...}}`:
 
 Wire states follow `AGENT_STATUS_STATE_DESIGN.md` v1.0: **four values**
-(`running` / `pause` / `resume` / `finalize`). Internal `tool` folds into
-`running` (the reason/tools stay on the event) and `suspend` folds into
-`pause`; `resume` is the one-shot approval edge.
+(`running` / `pause` / `resume` / `finalize`). Internal `tool` and `suspend`
+fold into `pause`; `resume` is the one-shot release edge after a pause
+(approval **or** tool result).
 
 | Hook | Event (wire state) | Dedup |
 | --- | --- | --- |
 | `wrap_model_call` entry | `running` | only if last state ≠ running |
 | model response with gated tools | `pause` (`human_approval`, gated tools listed) | every gated response |
-| approval resume | `resume` (one-shot; the next header also reports `resume`) | once per resume |
-| `wrap_tool_call` entry | `running` (`reason: await_tool`/`join_barrier`, tools listed) | every tool call |
-| `wrap_tool_call` exit | `running` | only when the last outstanding tool finishes |
+| approval/tool release | `resume` (one-shot; the next header also reports `resume`) | once per release |
+| `wrap_tool_call` entry | `pause` (`reason: await_tool`/`join_barrier`, tools listed) | every tool call |
+| `wrap_tool_call` exit | `resume` | only when the last outstanding tool finishes |
 | suspend threshold (`suspend_after_s`) | `pause` (`reason: checkpoint`) | once while parked |
 | `after_agent` | `finalize` | fires only on real completion (an approval pause suspends without finalize) |
 

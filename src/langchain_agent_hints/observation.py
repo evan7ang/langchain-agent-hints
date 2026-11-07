@@ -405,7 +405,7 @@ class ObservationStore:
                 else None
             )
             return NextActionHint(
-                state="running",  # tool folds to running on the wire (4-value contract)
+                state="pause",  # tool wait folds to pause on the wire (4-value contract)
                 tools=(PredictedTool(name=top_tool),) if top_tool else None,
                 prob=round(tool_share, 2),
             )

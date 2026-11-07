@@ -112,10 +112,10 @@ def test_gated_round_pauses_without_finalize_then_resumes(tmp_path: Path) -> Non
 
     assert _states(read_status_events(sink_path, "gate-1")) == [
         "running",
-        "pause",
-        "resume",  # approval resume edge (one-shot)
-        "running",  # tool wait (folded)
-        "running",  # tool completion
+        "pause",  # human approval
+        "resume",  # approval release (one-shot)
+        "pause",  # tool wait
+        "resume",  # tool result release (one-shot)
         "finalize",
     ]
     # Per-session ordering: the sink's seq counter is contiguous.
@@ -123,7 +123,7 @@ def test_gated_round_pauses_without_finalize_then_resumes(tmp_path: Path) -> Non
     assert [e["seq"] for e in all_events] == [1, 2, 3, 4, 5, 6]
 
 
-def test_ungated_tool_never_pauses(tmp_path: Path) -> None:
+def test_ungated_tool_is_a_pause(tmp_path: Path) -> None:
     spy = SpyChatModel(messages=iter(list(_gated_turns())))
     agent, sink_path = _build(tmp_path, spy, interrupt_tools=frozenset(), hitl=False)
 
@@ -133,8 +133,8 @@ def test_ungated_tool_never_pauses(tmp_path: Path) -> None:
     assert "__interrupt__" not in result
     assert _states(read_status_events(sink_path, "ungated")) == [
         "running",  # model call
-        "running",  # tool wait (folded: tool -> running, reason await_tool)
-        "running",  # tool completion
+        "pause",  # tool wait (await_tool)
+        "resume",  # tool result release (one-shot)
         "finalize",
     ]
 
@@ -166,7 +166,7 @@ def test_async_gated_round_matches_sync_semantics(tmp_path: Path) -> None:
         "running",
         "pause",
         "resume",
-        "running",
-        "running",
+        "pause",
+        "resume",
         "finalize",
     ]

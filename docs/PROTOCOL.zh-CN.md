@@ -26,7 +26,7 @@
 {"session":{"session_id":"s-1","agent_type":"my-agent","call_index":1,"epoch":0},
  "agent_status":{"state":"running","state_since_ms":1730000000000},
  "priority":{"level":3,"reason":"user_waiting"},
- "cache_control":[{"type":"pin","range":{"end":1}}]}
+ "cache_control":[{"type":"ephemeral","ttl_s":240,"range":{"end":1,"unit":"message"}}]}
 ```
 
 紧凑 JSON → UTF-8 字节 → 无 padding base64url → `X-Agent-Hint` 头值。
@@ -41,7 +41,7 @@ JSON 编码丢弃 `null`/未设置字段：**"不适用"的编码方式就是省
 | --- | --- | --- |
 | `session_id` | string | 服务会话身份。根运行：LangGraph `thread_id`。子代理运行：`{thread_id}:{agent_name}`。 |
 | `agent_type` | string | Agent 的服务侧名称（随组合而定；子代理上报自己的名称）。 |
-| `call_index` | int ≥ 1 | 该会话内模型调用的 1 起始序号。由持久化消息历史派生（`1 + count(AIMessage)`），进程重启后存活。 |
+| `call_index` | int ≥ 1 | 该会话内模型调用的 1 起始序号。首次从持久化消息历史播种（`1 + count(AIMessage)`），之后按会话高水位递增；压缩重写不回退。 |
 | `epoch` | int ≥ 0 | 会话的上下文代际计数。消息前缀被重写时递增（历史缩短或首消息变化——summarization 信号）。进程内事实（重启清零）。 |
 | `parent_session_id` | string | 仅子（子代理）请求携带；指向父会话 id。 |
 | `derivation` | object | 与 `parent_session_id` 同时出现。见 3.2。 |
@@ -58,16 +58,16 @@ JSON 编码丢弃 `null`/未设置字段：**"不适用"的编码方式就是省
 
 | 字段 | 类型 | 含义 |
 | --- | --- | --- |
-| `state` | `running` \| `tool` \| `pause` \| `suspend` \| `finalize` | 生命周期状态快照。带内 hint 上恒为 `running`（请求只在生成期存在）。 |
-| `state_since_ms` | epoch 毫秒 | 当前状态的起始时刻。hint 上：上一个工具结果落地的时刻（回退为请求准备时刻的墙钟）。 |
-| `reason` | string | 可选原因码（见 §4 事件）。 |
-| `tools` | array | 可选 `[{name, call_id?, child_session_id?}]`——`tool` 状态的 Agent 正在等待什么。 |
+| `state` | `running` \| `pause` \| `resume` \| `finalize` | 四值线缆状态；内部 `tool`/`suspend` 在发送方折成 `pause`。`resume` 是放行后的首条请求（一次性）。 |
+| `state_since_ms` | epoch 毫秒 | 当前状态的起始时刻（状态转换时刻；回退为请求准备时刻的墙钟）。 |
+| `reason` | string | **仅事件通道**，请求头不发。 |
+| `tools` | array | **仅事件通道**：`[{name, call_id?, child_session_id?}]`。 |
 
 ### 3.4 `priority` / `strict_priority`
 
 `{level: int, reason: string}`。级别遵循协议示例：`3` = 等待用户的交互型工作（`user_waiting`）；sync-join 的子代理位于父关键路径上（`critical_path`）。
 
-- `priority`——Agent 自身的服务优先级。级别在协议层折叠进二值域 `{1, 3}`（`3` = 用户介入/免准入，`1` = 其余；v1 遗留 `{2, 4}` 与越界值按准入线折叠，准入结果不变）。参考实现按请求触发源推导：人类消息/审批恢复 → `3/user_waiting`；工具续接或子 Agent → `1/critical_path`；批量运行 → `1/background`。组合显式配置仍优先。
+- `priority`——Agent 自身的服务优先级。简化契约按 reason 定档：只有 `user_waiting` 是 `3`；`critical_path` / `background` 是 `1`。审计 reason 的后缀（如 `background: context_compaction`）归一成基础词。参考实现按请求触发源推导：人类消息/审批恢复 → `3/user_waiting`；工具续接或子 Agent → `1/critical_path`；批量运行 → `1/background`。显式配置/服务值也按同一 reason 规则归一。
 - `strict_priority`——**保留给可信控制面；普通 Agent 永不发射。** 仅当组合显式注入（构造参数）时才会序列化，绝不从 Agent 事实推导。
 
 ### 3.5 `cache_control`
@@ -106,10 +106,11 @@ JSON 编码丢弃 `null`/未设置字段：**"不适用"的编码方式就是省
 | --- | --- |
 | `running` | 模型请求开始（也覆盖 reject/respond 恢复后直接回到模型）。重复被抑制——否则每次模型调用与工具完成都会重复上报。 |
 | `pause`（`reason: human_approval`） | 模型响应包含被人审门控的工具调用，恰在挂起开始之前。 |
-| `tool`（`reason: await_tool`） | 工具调用开始；`tools` 列出 `{name, call_id}`。 |
-| `running`（自 `tool`） | 会话**最后一个**在途工具完成（并行工具批只在最后一个 result 后报 running）。 |
-| `tool`（`reason: join_barrier`） | 委派工具（deepagents `task`）开始；`tools` 给出子 Agent 名（`agent:<type>`）与 `child_session_id`。父会话阻塞等待子会话。 |
-| `suspend`（`reason: checkpoint`） | 审批挂起超过配置的 `suspend_after_s` 阈值（可选，默认关闭）。 |
+| `pause`（`reason: await_tool`） | 工具调用开始；`tools` 列出 `{name, call_id}`。 |
+| `resume`（自 `tool`） | 会话**最后一个**在途工具完成（并行工具批只在最后一个 result 后报 resume）。 |
+| `pause`（`reason: join_barrier`） | 委派工具（deepagents `task`）开始；`tools` 给出子 Agent 名（`agent:<type>`）与 `child_session_id`。父会话阻塞等待子会话。 |
+| `pause`（`reason: checkpoint`） | 审批挂起超过配置的 `suspend_after_s` 阈值（可选，默认关闭）。 |
+| `resume` | 从 `pause`/`suspend`/`tool` 放行（审批或工具结果）后的一次性边。 |
 | `finalize` | 图运行真正完成。审批挂起中途暂停不触发 finalize；恢复后的运行恰好 finalize 一次。 |
 
 `pause` 事件可携带预估块：配置了预期等待时附 `"prediction": {"expected_resume_s": N}`。投递契约：**尽力而为**。sink 对瞬时失败重试数次后丢弃并告警——状态通道故障不得拖垮 Agent 运行。会话内顺序由 sink 的串行化 per-session `seq` 保证；跨进程恢复容忍来自 `state_since_ms` 时间戳与幂等的 `running` 转换。

@@ -66,11 +66,11 @@ def test_subagent_delegation_reports_join_barrier(tmp_path: Path) -> None:
     agent.invoke({"messages": [("user", "go")]}, config={"configurable": {"thread_id": "t"}})
 
     events = read_status_events(sink_path, "t")
-    # tool folds to running on the wire; the reason/tools stay on the event.
+    # a delegation wait is a pause; the reason/tools stay on the event.
     tool_events = [
         event
         for event in events
-        if event["agent_status"]["state"] == "running"
+        if event["agent_status"]["state"] == "pause"
         and event["agent_status"].get("reason") == "join_barrier"
     ]
     assert len(tool_events) == 1

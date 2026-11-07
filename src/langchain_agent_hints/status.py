@@ -62,7 +62,7 @@ from typing import Any, Protocol, cast
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage
 
-from langchain_agent_hints.middleware import resolve_session_identity
+from langchain_agent_hints.middleware import hint_suppressed, resolve_session_identity
 from langchain_agent_hints.schema import AgentState, InternalAgentState, StatusTool
 from langchain_agent_hints.signals import RunSignals
 
@@ -212,15 +212,17 @@ class _SessionState:
 def _wire_state(previous: InternalAgentState | None, state: InternalAgentState) -> AgentState:
     """Fold internal states to the 4-value wire contract.
 
-    - ``tool`` -> ``running`` (tool execution is still "working");
+    - ``tool`` -> ``pause`` (waiting for a tool is waiting for an external
+      event, same as a human approval);
     - ``suspend`` -> ``pause`` (waiting longer is still "someone is waiting");
-    - leaving ``pause``/``suspend`` -> ``resume`` (the one-shot approval edge);
+    - leaving ``pause``/``suspend``/``tool`` -> ``resume`` (the one-shot
+      release edge, whether the release came from a human or a tool result);
     - ``running`` / ``pause`` / ``finalize`` pass through.
     """
-    if previous in ("pause", "suspend") and state in ("running", "tool"):
+    if previous in ("pause", "suspend", "tool") and state == "running":
         return "resume"
     if state == "tool":
-        return "running"
+        return "pause"
     if state == "suspend":
         return "pause"
     return cast(AgentState, state)
@@ -400,6 +402,8 @@ class AgentStatusEventsMiddleware(AgentMiddleware):
     # -- sync hooks ----------------------------------------------------------
 
     def wrap_model_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
+        if hint_suppressed():
+            return handler(request)
         identity = resolve_session_identity()
         if identity is None:
             return handler(request)
@@ -426,6 +430,8 @@ class AgentStatusEventsMiddleware(AgentMiddleware):
         return None
 
     def wrap_tool_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
+        if hint_suppressed():
+            return handler(request)
         identity = resolve_session_identity()
         if identity is None:
             return handler(request)
@@ -453,6 +459,8 @@ class AgentStatusEventsMiddleware(AgentMiddleware):
     # -- async hooks (same semantics, shared machinery) ----------------------
 
     async def awrap_model_call(self, request: Any, handler: Callable[[Any], Awaitable[Any]]) -> Any:
+        if hint_suppressed():
+            return await handler(request)
         identity = resolve_session_identity()
         if identity is None:
             return await handler(request)
@@ -477,6 +485,8 @@ class AgentStatusEventsMiddleware(AgentMiddleware):
         return None
 
     async def awrap_tool_call(self, request: Any, handler: Callable[[Any], Awaitable[Any]]) -> Any:
+        if hint_suppressed():
+            return await handler(request)
         identity = resolve_session_identity()
         if identity is None:
             return await handler(request)

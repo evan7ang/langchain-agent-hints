@@ -61,7 +61,7 @@ def test_store_collects_measured_prediction() -> None:
     assert prediction.output_tokens == 120  # p90 of [100, 101, 120]
     assert prediction.remaining_calls == 1  # 2 calls per completed session
     assert prediction.next_action is not None
-    assert prediction.next_action.state == "running"  # tool folds to running on the wire
+    assert prediction.next_action.state == "pause"  # tool wait folds to pause on the wire
     assert prediction.next_action.tools is not None
     assert prediction.next_action.tools[0].name == "web_search"
     assert prediction.next_action.prob == 0.5

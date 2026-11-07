@@ -41,7 +41,7 @@ The protocol defines two channels:
 {"session":{"session_id":"s-1","agent_type":"my-agent","call_index":1,"epoch":0},
  "agent_status":{"state":"running","state_since_ms":1730000000000},
  "priority":{"level":3,"reason":"user_waiting"},
- "cache_control":[{"type":"pin","range":{"end":1}}]}
+ "cache_control":[{"type":"ephemeral","ttl_s":240,"range":{"end":1,"unit":"message"}}]}
 ```
 
 Compact JSON → UTF-8 bytes → unpadded base64url → `X-Agent-Hint` header value.
@@ -57,7 +57,7 @@ applicable"** (e.g. root sessions carry no `parent_session_id`).
 | --- | --- | --- |
 | `session_id` | string | Identity of the serving session. Root runs: the LangGraph `thread_id`. Subagent runs: `{thread_id}:{agent_name}`. |
 | `agent_type` | string | Serving-side name of the agent (composition-specific; subagents report their own name). |
-| `call_index` | int ≥ 1 | 1-based index of this model call within the session. Derived from the persistent message history (`1 + count(AIMessage)`), so it survives process restarts. |
+| `call_index` | int ≥ 1 | 1-based index of this model call within the session. Seeded from the persistent message history (`1 + count(AIMessage)`) and kept as a session high-water counter; a compaction rewrite does not rewind it. |
 | `epoch` | int ≥ 0 | Context-generation counter of the session. Bumped when the message prefix is rewritten (history shrinks or the first message changes — the summarization signal). In-process fact (restarts reset it). |
 | `parent_session_id` | string | Present only on child (subagent) requests; the parent's session id. |
 | `derivation` | object | Present only with `parent_session_id`. See 3.2. |
@@ -74,7 +74,7 @@ applicable"** (e.g. root sessions carry no `parent_session_id`).
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `state` | `running` \| `pause` \| `resume` \| `finalize` | Wire lifecycle snapshot (4 values, `AGENT_STATUS_STATE_DESIGN.md` v1.0). Internal `tool` folds to `running` and `suspend` folds to `pause` at the harness boundary; `resume` marks the first request after an approval pause (one-shot). |
+| `state` | `running` \| `pause` \| `resume` \| `finalize` | Wire lifecycle snapshot (4 values, `AGENT_STATUS_STATE_DESIGN.md` v1.0). Internal `tool`/`suspend` fold to `pause` at the harness boundary; `resume` marks the first request after a pause (approval **or** tool result, one-shot). |
 | `state_since_ms` | epoch ms | Instant the current state began. On the hint: the tracked transition instant (request wall clock as the fallback). |
 | `reason` | string | **Event channel only** — not emitted in the request header. |
 | `tools` | array | **Event channel only** — `[{name, call_id?, child_session_id?}]` on the out-of-band event. |
@@ -85,14 +85,15 @@ applicable"** (e.g. root sessions carry no `parent_session_id`).
 interactive work waiting on the user (`user_waiting`); sync-joined children
 sit on the parent's critical path (`critical_path`).
 
-- `priority` — the agent's own serving priority. Levels are folded into the
-  contracted two-value domain `{1, 3}` at the protocol layer (`3` =
-  user-intervened / admission-exempt, `1` = everything else; legacy `{2, 4}`
-  and out-of-range values fold without changing admission outcomes). The
+- `priority` — the agent's own serving priority. The simplified contract is
+  reason-driven: only `user_waiting` is `3`; `critical_path` and `background`
+  are `1`. Audit reasons may carry a suffix (e.g.
+  `background: context_compaction`); the wire reason is the base word. The
   reference implementation derives the value from the request trigger: a
   human message or an approval resume is `3/user_waiting`; a tool-result
   continuation or a subagent run is `1/critical_path`; batch runs are
-  `1/background`. Explicit composition values still win.
+  `1/background`. Explicit composition/service values are normalized by the
+  same reason rule.
 - `strict_priority` — **reserved for a trusted control plane; ordinary agents
   never emit it.** It is only serialized when the composition injects it
   explicitly (constructor argument), never derived from agent facts.
@@ -156,12 +157,12 @@ Transition rules (wire states; internal `tool`/`suspend` are folded):
 | Transition | Emitted when |
 | --- | --- |
 | `running` | A model request starts. Repeats are suppressed — every model call and tool completion would otherwise re-report it. |
-| `running` (`reason: await_tool`, `tools`) | A tool call begins (internal `tool` folds to `running`; the tool name/call_id stay on the event). |
-| `running` (`reason: join_barrier`, `tools`) | A delegation tool (deepagents `task`) starts; `tools` names the child (`agent:<type>`) and carries `child_session_id`. |
-| `running` (from a tool) | The session's **last** outstanding tool completes (parallel batches report running only after the last result). |
+| `pause` (`reason: await_tool`, `tools`) | A tool call begins (internal `tool` folds to `pause`; the tool name/call_id stay on the event). |
+| `pause` (`reason: join_barrier`, `tools`) | A delegation tool (deepagents `task`) starts; `tools` names the child (`agent:<type>`) and carries `child_session_id`. |
+| `resume` (from a tool) | The session's **last** outstanding tool completes (parallel batches report resume only after the last result). |
 | `pause` (`reason: human_approval`) | A model response contains a tool call gated for human approval, just before the suspension begins. |
 | `pause` (`reason: checkpoint`) | An approval pause outlives `suspend_after_s` (optional; off by default; internal `suspend` folds to `pause`). |
-| `resume` | The transition out of `pause`/`suspend` — the one-shot approval edge. The next request header also reports `resume`. |
+| `resume` | The transition out of `pause`/`suspend`/`tool` — the one-shot release edge. The next request header also reports `resume`. |
 | `finalize` | The graph run actually completes. An approval pause suspends mid-run without finalize; the resumed run finalizes exactly once. |
 
 A `pause` event may carry an estimate block: `"prediction":

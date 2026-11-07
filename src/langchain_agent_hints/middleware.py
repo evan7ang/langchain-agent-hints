@@ -21,9 +21,9 @@ Emission rules (docs/PROTOCOL.md §4/§5):
 - auxiliary model calls that bypass the middleware chain (e.g.
   SummarizationMiddleware's own summarization request) are naturally never
   hinted — only requests that flow through ``wrap_model_call`` are;
-- ``call_index`` is derived from the persistent message history
-  (``1 + count(AIMessage in request.messages)``): the history lives in the
-  checkpointer, so the counter survives process restarts with zero state;
+- ``call_index`` is a session-local high-water counter seeded from the
+  persistent message history (``1 + count(AIMessage)``) on first sight and
+  incremented per hinted request; a compaction rewrite must not rewind it;
 - ``epoch`` stays a per-session in-process fact: bumped when the message
   prefix is rewritten (count shrinks or the first message changes).
 
@@ -63,6 +63,8 @@ import json
 import threading
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -94,6 +96,39 @@ from langchain_agent_hints.signals import RunSignals
 
 #: Policy sentinel: derive the value from the request/observations.
 AUTO = "auto"
+
+#: Context flag for auxiliary model calls (compaction summaries, titles, ...).
+#: The RFC requires them to carry no hint and no lifecycle transition; an outer
+#: middleware sets this around its auxiliary handler call.
+_SUPPRESS_HINT: ContextVar[bool] = ContextVar(
+    "langchain_agent_hints_suppress", default=False
+)
+
+
+def hint_suppressed() -> bool:
+    """Whether the current model call is an auxiliary request."""
+    return _SUPPRESS_HINT.get()
+
+
+@contextmanager
+def suppress_hints() -> Any:
+    """Mark one model call as auxiliary (no hint, no status transition).
+
+    Composition usage::
+
+        from langchain_agent_hints import suppress_hints
+
+        class CompactionMiddleware(AgentMiddleware):
+            def wrap_model_call(self, request, handler):
+                with suppress_hints():
+                    summary = handler(request.override(messages=history))
+                ...
+    """
+    token = _SUPPRESS_HINT.set(True)
+    try:
+        yield
+    finally:
+        _SUPPRESS_HINT.reset(token)
 
 
 @dataclass(frozen=True)
@@ -268,11 +303,12 @@ def _merge_prediction(
 
 
 class _SessionTrack:
-    """Per-session in-process facts (epoch, cache-prefix key)."""
+    """Per-session in-process facts (epoch, call ordinal, cache-prefix key)."""
 
-    __slots__ = ("epoch", "fingerprint", "prefix_key")
+    __slots__ = ("call_index", "epoch", "fingerprint", "prefix_key")
 
     def __init__(self) -> None:
+        self.call_index: int | None = None
         self.epoch = 0
         self.fingerprint: tuple[int, str] | None = None
         self.prefix_key: str | None = None
@@ -363,6 +399,23 @@ class AgentHintsMiddleware(AgentMiddleware):
             return identity.agent_name or "subagent"
         return self._agent_type
 
+    def _next_call_index(self, session_id: str, messages: list[AnyMessage]) -> int:
+        """Session-local, monotonic call ordinal.
+
+        Seeded from the persistent history on first sight, then incremented per
+        hinted request. A summarization rewrite shrinks the history but must
+        not rewind the ordinal observed by consumers (RFC: call_index only
+        increases); the session track carries the high-water mark across the
+        epoch bump.
+        """
+        with self._lock:
+            track = self._tracks.setdefault(session_id, _SessionTrack())
+            if track.call_index is None:
+                track.call_index = _call_index(messages)
+            else:
+                track.call_index += 1
+            return track.call_index
+
     def _take_epoch_slot(self, session_id: str, fingerprint: tuple[int, str]) -> tuple[int, bool]:
         """Update the session epoch; return ``(epoch, prefix_rewritten)``."""
         with self._lock:
@@ -442,6 +495,8 @@ class AgentHintsMiddleware(AgentMiddleware):
         ``None`` when the run has no session identity — the degradation rule
         (no identity, no hint), matching the protocol's mandatory ``session``.
         """
+        if hint_suppressed():
+            return None
         identity = resolve_session_identity()
         if identity is None:
             return None
@@ -459,7 +514,7 @@ class AgentHintsMiddleware(AgentMiddleware):
         agent_type = self._agent_type_for(identity)
 
         now_ms = self._clock()
-        call_index = _call_index(request.messages)
+        call_index = self._next_call_index(identity.session_id, request.messages)
         self._observation.model_call_started(identity.session_id, now_ms=now_ms)
         measured = self._observation.prediction(
             identity.session_id, agent_type, call_index=call_index, now_ms=now_ms
@@ -471,8 +526,9 @@ class AgentHintsMiddleware(AgentMiddleware):
         status_state: AgentState
         if resumed:
             status_state = "resume"
-        elif current in ("pause", "suspend"):
-            # A request made while the agent is parked still reports the wait.
+        elif current in ("pause", "suspend", "tool"):
+            # A request made while the agent is parked (including a tool wait)
+            # still reports the wait.
             status_state = "pause"
         else:
             status_state = "running"

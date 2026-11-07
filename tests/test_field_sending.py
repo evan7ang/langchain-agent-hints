@@ -143,7 +143,7 @@ def test_in_band_resume_is_one_shot(monkeypatch) -> None:
     monkeypatch.setattr(middleware_mod, "ensure_config", lambda: _config(thread_id="r"))
     signals = RunSignals()
     mw = AgentHintsMiddleware(agent_type="a", signals=signals)
-    signals.observe_transition("r", "pause", "tool", 42)
+    signals.observe_transition("r", "pause", "running", 42)
 
     first = _wire(_Request([HumanMessage(content="go")]), mw)
     second = _wire(_Request([HumanMessage(content="go")]), mw)

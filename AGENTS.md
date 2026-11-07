@@ -41,7 +41,7 @@ examples/
 1. **分层不可倒置**：`schema.py` 只用 stdlib（wire 形状不依赖 harness 即可单测）；`middleware.py` / `status.py` 只用 langchain 公开 API（如 `AgentMiddleware`），零私有 import——这是"可发布中间件"的资格线，新增依赖前先确认不破坏该约束。
 2. **header-only 通道**：hint 只经 `X-Agent-Hint` 头发射（紧凑 UTF-8 JSON → 无 padding base64url → 头）；请求体不得出现任何 hint 字段。`extra_headers` 合并为增量语义。
 3. **v1 永不发射**：`prediction`、`strict_priority`、`derivation.fork_point` 只在 schema 中定义、构造器不填，测试锁死该边界。
-4. **派生规则**：`call_index` 由消息历史派生（`1 + count(AIMessage)`）；`epoch` 是进程内前缀指纹启发式，重启清零是文档化限制。若用事件源替代启发式，属接口演进，先升 `docs/PROTOCOL.md` 版本节再动代码。
+4. **派生规则**：`call_index` 首次从消息历史播种（`1 + count(AIMessage)`），之后按会话高水位递增，压缩重写不回退；`epoch` 是进程内前缀指纹启发式，重启清零是文档化限制。若用事件源替代启发式，属接口演进，先升 `docs/PROTOCOL.md` 版本节再动代码。
 5. **身份与配置**：`agent_type` 构造必传（身份是组合特有事实）；库本身不读环境变量，env 开关是 README 记录的组合层模式。
 6. **sink 契约**：`StatusEventSink` 是同步单方法协议，best-effort 投递（重试后丢弃并告警，不拖垮 agent run）；会话内 `seq` 有序由 sink 保证。
 7. **时序事实**：钩子触发时序以 `docs/COMPATIBILITY.md` 的实测记录为基线；升级 langchain / deepagents 后必须重验并更新该记录。

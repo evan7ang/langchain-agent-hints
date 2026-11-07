@@ -7,12 +7,16 @@ from pathlib import Path
 from typing import Any
 
 from langchain.agents import create_agent
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import MemorySaver
 
 from conftest import SpyChatModel, hinted_headers, independent_decode, read_status_events
-from langchain_agent_hints.middleware import AgentHintsMiddleware
+from langchain_agent_hints.middleware import (
+    AgentHintsMiddleware,
+    hint_suppressed,
+    suppress_hints,
+)
 from langchain_agent_hints.status import AgentStatusEventsMiddleware, JsonlStatusEventSink
 
 
@@ -94,7 +98,7 @@ def test_two_calls_hinted_with_state_derived_call_index(tmp_path: Path) -> None:
 
     # The full status lifecycle of the plain round rode along.
     states = [e["agent_status"]["state"] for e in read_status_events(sink_path, "t1")]
-    assert states == ["running", "running", "running", "finalize"]
+    assert states == ["running", "pause", "resume", "finalize"]
 
 
 def test_no_thread_id_degrades_to_no_hint_no_events(tmp_path: Path) -> None:
@@ -135,7 +139,7 @@ def test_async_path_hints_identically(tmp_path: Path) -> None:
     assert [h["session"]["call_index"] for h in hints] == [1, 2]
     assert hints[0]["session"]["session_id"] == "t-async"
     states = [e["agent_status"]["state"] for e in read_status_events(sink_path, "t-async")]
-    assert states == ["running", "running", "running", "finalize"]
+    assert states == ["running", "pause", "resume", "finalize"]
 
 
 def test_epoch_bumps_on_prefix_rewrite() -> None:
@@ -145,3 +149,19 @@ def test_epoch_bumps_on_prefix_rewrite() -> None:
     assert mw._take_epoch_slot("s", (2, "aaa")) == (1, True)  # shrink signal
     assert mw._take_epoch_slot("s", (2, "bbb")) == (2, True)  # first message changed
     assert mw._take_epoch_slot("other", (1, "aaa")) == (0, False)  # per-session
+
+
+def test_call_index_does_not_reset_after_prefix_rewrite() -> None:
+    mw = AgentHintsMiddleware(agent_type="t")
+    assert mw._next_call_index("s", [HumanMessage(content="go")]) == 1
+    assert mw._next_call_index("s", [HumanMessage(content="go"), AIMessage(content="a")]) == 2
+    # A summarization rewrite shrinks the history (0 AIMessage) but the
+    # session ordinal continues: call_index only increases.
+    assert mw._next_call_index("s", [HumanMessage(content="summary")]) == 3
+
+
+def test_suppress_hints_skips_auxiliary_calls() -> None:
+    assert hint_suppressed() is False
+    with suppress_hints():
+        assert hint_suppressed() is True
+    assert hint_suppressed() is False
