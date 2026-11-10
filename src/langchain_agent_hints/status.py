@@ -299,7 +299,9 @@ class AgentStatusEventsMiddleware(AgentMiddleware):
                 outstanding_tools=track.outstanding_tools,
             )
             self._cancel_suspend_timer_locked(session_id)
-            self._signals.observe_transition(session_id, track.last_state, state, self._clock())
+            self._signals.observe_transition(
+                session_id, track.last_state, state, self._clock(), reason=reason
+            )
             if state == "pause" and self._suspend_after_s is not None:
                 timer = threading.Timer(
                     max(0.0, float(self._suspend_after_s)),
@@ -335,7 +337,9 @@ class AgentStatusEventsMiddleware(AgentMiddleware):
                 last_state="suspend",
                 outstanding_tools=track.outstanding_tools,
             )
-            self._signals.observe_transition(session_id, "pause", "suspend", self._clock())
+            self._signals.observe_transition(
+                session_id, "pause", "suspend", self._clock(), reason="checkpoint"
+            )
             self._suspend_timers.pop(session_id, None)
         self._sink.send(
             status_event(session_id, "pause", reason="checkpoint", now_ms=self._clock())
@@ -362,7 +366,9 @@ class AgentStatusEventsMiddleware(AgentMiddleware):
                 last_state="tool",
                 outstanding_tools=track.outstanding_tools + 1,
             )
-            self._signals.observe_transition(session_id, track.last_state, "tool", self._clock())
+            self._signals.observe_transition(
+                session_id, track.last_state, "tool", self._clock(), reason=reason
+            )
         self._sink.send(
             status_event(
                 session_id,

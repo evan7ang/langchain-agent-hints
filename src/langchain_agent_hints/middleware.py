@@ -519,7 +519,10 @@ class AgentHintsMiddleware(AgentMiddleware):
         )
         prediction = _merge_prediction(measured, self._configured_prediction)
         resumed = self._signals.take_resumed(identity.session_id)
-        priority = self._resolve_priority(identity, request, resumed=resumed)
+        approval_resume = (
+            self._signals.take_approval_resume(identity.session_id) if resumed else False
+        )
+        priority = self._resolve_priority(identity, request, resumed=approval_resume)
         current = self._signals.current_state(identity.session_id)
         status_state: AgentState
         if resumed:

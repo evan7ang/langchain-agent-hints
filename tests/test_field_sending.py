@@ -143,7 +143,7 @@ def test_in_band_resume_is_one_shot(monkeypatch) -> None:
     monkeypatch.setattr(middleware_mod, "ensure_config", lambda: _config(thread_id="r"))
     signals = RunSignals()
     mw = AgentHintsMiddleware(agent_type="a", signals=signals)
-    signals.observe_transition("r", "pause", "running", 42)
+    signals.observe_transition("r", "pause", "running", 42, reason="human_approval")
 
     first = _wire(_Request([HumanMessage(content="go")]), mw)
     second = _wire(_Request([HumanMessage(content="go")]), mw)
@@ -159,6 +159,6 @@ def test_in_band_pause_while_parked(monkeypatch) -> None:
     monkeypatch.setattr(middleware_mod, "ensure_config", lambda: _config(thread_id="p"))
     signals = RunSignals()
     mw = AgentHintsMiddleware(agent_type="a", signals=signals)
-    signals.observe_transition("p", "running", "pause", 10)
+    signals.observe_transition("p", "running", "pause", 10, reason="human_approval")
     wire = _wire(_Request([HumanMessage(content="heartbeat")]), mw)
     assert wire["agent_status"]["state"] == "pause"

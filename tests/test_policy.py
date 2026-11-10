@@ -145,7 +145,7 @@ def test_priority_auto_classification() -> None:
 
     # The shared RunSignals itself flags exactly one resume.
     signals = RunSignals()
-    signals.observe_transition("t", "pause", "running", 42)
+    signals.observe_transition("t", "pause", "running", 42, reason="human_approval")
     assert signals.take_resumed("t") is True
     assert signals.take_resumed("t") is False
 
