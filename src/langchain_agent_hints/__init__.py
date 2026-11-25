@@ -11,6 +11,7 @@ langchain public API only) so the wire shape is testable without langchain.
 
 from __future__ import annotations
 
+from langchain_agent_hints.manage import HttpManageRequestClient, ManageRequestError
 from langchain_agent_hints.middleware import (
     AgentHintsMiddleware,
     SessionIdentity,
@@ -37,6 +38,8 @@ from langchain_agent_hints.schema import (
     AgentStatus,
     CacheControlHint,
     CacheControlRange,
+    ContextEdit,
+    ContextManagement,
     DerivationHint,
     HintOptions,
     HintRequestFacts,
@@ -47,6 +50,7 @@ from langchain_agent_hints.schema import (
     SessionHint,
     StatusTool,
     build_agent_hint,
+    build_manage_hint,
     decode_agent_hint,
     encode_agent_hint,
     hint_to_dict,
@@ -61,7 +65,7 @@ from langchain_agent_hints.status import (
     status_event,
 )
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "HINT_HEADER",
@@ -72,6 +76,8 @@ __all__ = [
     "AgentStatusEventsMiddleware",
     "CacheControlHint",
     "CacheControlRange",
+    "ContextEdit",
+    "ContextManagement",
     "DEFAULT_CACHE_CONTROL",
     "DEFAULT_PRIORITY",
     "DEFAULT_SUBAGENT_PRIORITY",
@@ -79,7 +85,9 @@ __all__ = [
     "HintOptions",
     "HintRequestFacts",
     "HttpStatusEventSink",
+    "HttpManageRequestClient",
     "JsonlStatusEventSink",
+    "ManageRequestError",
     "NextActionHint",
     "ObservationOptions",
     "ObservationStore",
@@ -99,6 +107,7 @@ __all__ = [
     "StatusEventSink",
     "StatusTool",
     "build_agent_hint",
+    "build_manage_hint",
     "decode_agent_hint",
     "hint_suppressed",
     "suppress_hints",

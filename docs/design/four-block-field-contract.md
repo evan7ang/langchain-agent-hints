@@ -6,6 +6,12 @@
 > 规范原文：`agent-hint-research/AgentHint-下发字段规范-v1.md`（本仓外）。
 > 取代关系：本文取代 [PROTOCOL.md](../PROTOCOL.md) §3.1 中「根会话省略 `parent_session_id`」、
 > §3.5 `cache_control` 为数组的表述；`agent_status` 四值折叠与二值 `priority` 的裁决不变。
+>
+> **2026-11-25 范围替代**：本文关于「`context_management` 恒存在」「`session.state` 六值（含
+> `pause`/`resume`/`compact`）」「`manage_request` 恒为 `"false"`」的裁决已被
+> [v1-ordinary-manage-split.md](v1-ordinary-manage-split.md) 替代（普通请求只发 `start`/`append`，
+> `context_management` 只出现在独立管理请求）。本文其余裁决（`priority_control`、单对象
+> `cache_control`、根会话显式 `null`）继续有效。
 
 ## 1. 背景
 

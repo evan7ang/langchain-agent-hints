@@ -72,6 +72,11 @@ from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
 from langchain_core.runnables import ensure_config
 
+from langchain_agent_hints.manage import (
+    HttpManageRequestClient,
+    ManageRequestError,
+    ManageVerb,
+)
 from langchain_agent_hints.observation import ObservationOptions, ObservationStore
 from langchain_agent_hints.policy import (
     build_cache_control,
@@ -303,13 +308,15 @@ def _merge_prediction(
 class _SessionTrack:
     """Per-session in-process facts (epoch, call ordinal, cache-prefix key)."""
 
-    __slots__ = ("call_index", "epoch", "fingerprint", "prefix_key")
+    __slots__ = ("call_index", "epoch", "fingerprint", "prefix_key", "resume_sent", "paused")
 
     def __init__(self) -> None:
         self.call_index: int | None = None
         self.epoch = 0
         self.fingerprint: tuple[int, str] | None = None
         self.prefix_key: str | None = None
+        self.resume_sent = False
+        self.paused = False
 
 
 class AgentHintsMiddleware(AgentMiddleware):
@@ -335,6 +342,7 @@ class AgentHintsMiddleware(AgentMiddleware):
         observation: ObservationOptions | ObservationStore | None = None,
         signals: RunSignals | None = None,
         run_mode: str = "interactive",
+        manage: HttpManageRequestClient | None = None,
         clock: Callable[[], int] | None = None,
     ) -> None:
         """Fix the composition-level hint policy.
@@ -349,6 +357,13 @@ class AgentHintsMiddleware(AgentMiddleware):
 
         ``signals``: share one ``RunSignals`` with ``AgentStatusEventsMiddleware``
         to get the tracked ``state_since_ms`` and approval-resume priority.
+
+        ``manage``: an :class:`HttpManageRequestClient`. When omitted, the
+        middleware implements the L1 profile (ordinary requests only, no
+        manage traffic). When supplied, it auto-emits ``resume`` for
+        adopted/restored sessions and ``compact`` after a committed prefix
+        rewrite; compositions can call :meth:`send_manage` for ``pause`` /
+        ``stop`` from their own lifecycle hooks.
 
         ``strict_priority`` is control-plane-only (emitted only when injected).
         ``prediction`` supplies static per-field overrides for the measured
@@ -378,6 +393,7 @@ class AgentHintsMiddleware(AgentMiddleware):
         else:
             self._observation = ObservationStore(observation or ObservationOptions())
         self._signals = signals or RunSignals()
+        self._manage = manage
         self._clock = clock or (lambda: time.time_ns() // 1_000_000)
         self._lock = threading.Lock()
         self._tracks: dict[str, _SessionTrack] = {}
@@ -434,6 +450,59 @@ class AgentHintsMiddleware(AgentMiddleware):
             previous = track.prefix_key
             track.prefix_key = key
             return previous is not None and previous != key
+
+    def _resume_needed(self, session_id: str, messages: list[AnyMessage]) -> bool:
+        """One-shot ``resume`` decision for the upcoming ordinary request.
+
+        A ``resume`` is emitted when the composition paused the session, or
+        when a session is first seen with existing history (adopted / restored
+        / forked context: protocol §7.4). A brand-new session never resumes.
+        Must be called before :meth:`_next_call_index`, while ``call_index`` is
+        still ``None`` for a first sight.
+        """
+        with self._lock:
+            track = self._tracks.setdefault(session_id, _SessionTrack())
+            if track.paused:
+                track.paused = False
+                return True
+            if track.resume_sent:
+                return False
+            track.resume_sent = True
+            return track.call_index is None and _call_index(messages) > 1
+
+    def send_manage(
+        self,
+        verb: ManageVerb,
+        session_id: str,
+        *,
+        parent_session_id: str | None = None,
+    ) -> None:
+        """Send ``pause`` / ``stop`` from a composition lifecycle hook.
+
+        The harness itself never emits ``pause`` on turn end or ``stop`` on
+        task completion (protocol §8.1/§12.5); the composition calls this when
+        it observes a real "leaving" or "destroy/archive" event. ``resume``
+        and ``compact`` are emitted automatically at the request boundary.
+        """
+        if self._manage is None:
+            msg = "no manage client configured; pass manage=HttpManageRequestClient(...)"
+            raise ManageRequestError(msg)
+        if verb not in ("pause", "stop"):
+            msg = "send_manage only accepts 'pause' or 'stop'; resume/compact are automatic"
+            raise ValueError(msg)
+        with self._lock:
+            track = self._tracks.get(session_id)
+            call_index = track.call_index if track and track.call_index else 1
+            epoch = track.epoch if track else 0
+            if verb == "pause":
+                self._tracks.setdefault(session_id, _SessionTrack()).paused = True
+        self._manage.send(
+            verb,
+            session_id,
+            call_index=call_index,
+            epoch=epoch,
+            parent_session_id=parent_session_id,
+        )
 
     def _resolve_priority(
         self, identity: SessionIdentity, request: Any, *, resumed: bool
@@ -512,7 +581,35 @@ class AgentHintsMiddleware(AgentMiddleware):
         agent_type = self._agent_type_for(identity)
 
         now_ms = self._clock()
+        # Manage barrier + rewrite detection run before the call ordinal so a
+        # `compact` request can name the rewritten step and its old epoch.
+        if self._manage is not None:
+            self._manage.ensure_ready(identity.session_id)
+        epoch, rewritten = self._take_epoch_slot(
+            identity.session_id, _fingerprint(request.messages)
+        )
+        resume_needed = self._resume_needed(identity.session_id, request.messages)
         call_index = self._next_call_index(identity.session_id, request.messages)
+        if self._manage is not None:
+            if resume_needed:
+                # Adopted/restored session, or one the composition paused.
+                self._manage.send(
+                    "resume",
+                    identity.session_id,
+                    call_index=call_index,
+                    epoch=epoch,
+                    parent_session_id=parent_session_id,
+                )
+            if rewritten:
+                # The manage request carries the OLD epoch; this ordinary
+                # request already carries the bumped one (protocol §6.3).
+                self._manage.send(
+                    "compact",
+                    identity.session_id,
+                    call_index=max(1, call_index - 1),
+                    epoch=max(0, epoch - 1),
+                    parent_session_id=parent_session_id,
+                )
         self._observation.model_call_started(identity.session_id, now_ms=now_ms)
         measured = self._observation.prediction(
             identity.session_id, agent_type, call_index=call_index, now_ms=now_ms
@@ -533,9 +630,6 @@ class AgentHintsMiddleware(AgentMiddleware):
             status_state = "pause"
         else:
             status_state = "running"
-        epoch, rewritten = self._take_epoch_slot(
-            identity.session_id, _fingerprint(request.messages)
-        )
         cache_control = self._resolve_cache_control(
             identity,
             request,
@@ -563,7 +657,6 @@ class AgentHintsMiddleware(AgentMiddleware):
             prediction=prediction,
             strict_priority=self._strict_priority,
             state=status_state,
-            rewritten=rewritten,
         )
 
         model_settings = dict(request.model_settings)

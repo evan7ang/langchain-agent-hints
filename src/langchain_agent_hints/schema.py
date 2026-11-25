@@ -65,9 +65,10 @@ class SessionHint:
     """``session`` block: who is calling, from which lineage, at which call."""
 
     session_id: str
-    agent_type: str
     call_index: int
     epoch: int
+    #: Serving-side agent name. Optional: manage requests carry no agent type.
+    agent_type: str | None = None
     state: SessionState = "append"
     parent_session_id: str | None = None
     derivation: DerivationHint | None = None
@@ -112,15 +113,24 @@ class ContextEdit:
     """One ``context_management.edits`` entry."""
 
     type: Literal["offload", "prefetch", "evict"]
-    target: Literal["session", "messages", "tools"] = "session"
+    target: Literal["session"] = "session"
 
 
 @dataclass(frozen=True)
 class ContextManagement:
-    """``context_management`` block: always present, empty edits by default."""
+    """``context_management`` block — **manage requests only** (protocol §5.3).
 
-    manage_request: Literal["true", "false"] = "false"
+    ``manage_request`` is the JSON boolean ``true`` and v1 carries exactly one
+    explicit edit. Ordinary requests must omit the whole block.
+    """
+
+    manage_request: Literal[True] = True
     edits: tuple[ContextEdit, ...] = ()
+
+    def __post_init__(self) -> None:
+        if len(self.edits) != 1:
+            msg = "context_management.edits must carry exactly one edit in v1"
+            raise ValueError(msg)
 
 
 @dataclass(frozen=True)
@@ -251,7 +261,8 @@ class AgentHint:
     """The complete AgentHint object sent (encoded) as ``X-Agent-Hint``."""
 
     session: SessionHint
-    context_management: ContextManagement
+    # Manage requests only; ordinary requests omit the block (protocol §5.3).
+    context_management: ContextManagement | None = None
     agent_status: AgentStatus | None = None
     priority: PriorityHint | None = None
     priority_control: PriorityControl | None = None
@@ -306,33 +317,51 @@ def _drop_none(value: Any) -> Any:
     return value
 
 
-def _session_state(
-    status: AgentState,
-    call_index: int,
-    has_parent: bool,
-    rewritten: bool,
-) -> SessionState:
-    """Summarize the request into the six-value ``session.state``.
+def _session_state(call_index: int, has_parent: bool) -> SessionState:
+    """Ordinary requests only carry ``start`` or ``append`` (protocol §5.2).
 
-    Precedence mirrors the cross-harness contract: an open wait wins, then a
-    just-rewritten prefix, then the one-shot resume, then the root's first call.
+    ``start`` means a brand-new root context on its first accepted call; every
+    other main-line request (tool continuations, compaction follow-ups, adopted
+    sessions) is ``append``. Lifecycle verbs live on manage requests.
     """
-    if status == "pause":
-        return "pause"
-    if rewritten:
-        return "compact"
-    if status == "resume":
-        return "resume"
     if call_index == 1 and not has_parent:
         return "start"
     return "append"
 
 
-_EDITS_BY_STATE: dict[str, tuple[ContextEdit, ...]] = {
-    "pause": (ContextEdit(type="offload"),),
-    "resume": (ContextEdit(type="prefetch"),),
-    "compact": (ContextEdit(type="evict"),),
+#: Fixed verb -> edit mapping (protocol §8.2).
+MANAGE_EDITS: dict[str, Literal["offload", "prefetch", "evict"]] = {
+    "pause": "offload",
+    "resume": "prefetch",
+    "stop": "evict",
+    "compact": "evict",
 }
+
+
+def build_manage_hint(
+    *,
+    session_id: str,
+    verb: Literal["pause", "resume", "stop", "compact"],
+    call_index: int,
+    epoch: int,
+    parent_session_id: str | None = None,
+) -> AgentHint:
+    """Build one manage request hint (``session`` + ``context_management``).
+
+    ``epoch`` is the epoch the edit applies to: a ``compact`` request carries
+    the **old** epoch of the rewritten context (protocol §6.3); the following
+    ordinary request carries ``epoch + 1``.
+    """
+    return AgentHint(
+        session=SessionHint(
+            session_id=session_id,
+            call_index=call_index,
+            epoch=epoch,
+            state=verb,
+            parent_session_id=parent_session_id,
+        ),
+        context_management=ContextManagement(edits=(ContextEdit(type=MANAGE_EDITS[verb]),)),
+    )
 
 
 def _fold_strict_priority(priority: PriorityHint | None) -> PriorityHint | None:
@@ -353,14 +382,18 @@ def build_agent_hint(
     prediction: PredictionHint | None = None,
     strict_priority: PriorityHint | None = None,
     state: AgentState = "running",
-    rewritten: bool = False,
 ) -> AgentHint:
-    """Build one AgentHint for a main-line model request.
+    """Build one AgentHint for a main-line (ordinary) model request.
 
-    The request-time state is always ``running`` (a request is only prepared
-    while the agent generates), so the hint carries the tracked transition
-    instant — the middleware passes the instant the previous tool result
-    landed; ``now_ms`` is the fallback for calls without an observed instant.
+    ``session.state`` is only ``start`` or ``append`` (protocol §5.2); the
+    block ``context_management`` is omitted entirely and lifecycle verbs travel
+    on manage requests (see :func:`build_manage_hint`).
+
+    ``agent_status`` still records the request-time snapshot (a tolerated
+    superset field): ``state`` defaults to ``running`` and the hint carries the
+    tracked transition instant — the middleware passes the instant the previous
+    tool result landed; ``now_ms`` is the fallback for calls without an
+    observed instant.
 
     Root requests (no ``parent_session_id``) omit the lineage fields entirely;
     child requests carry ``parent_session_id`` + ``derivation`` — foreground
@@ -383,7 +416,7 @@ def build_agent_hint(
         if has_parent and facts.parent_relation is not None
         else None
     )
-    session_state = _session_state(state, facts.call_index, has_parent, rewritten)
+    session_state = _session_state(facts.call_index, has_parent)
     priority = _fold_priority(options.priority)
     cache_control = None
     if options.cache_control:
@@ -407,7 +440,7 @@ def build_agent_hint(
             parent_session_id=facts.parent_session_id if has_parent else None,
             derivation=derivation,
         ),
-        context_management=ContextManagement(edits=_EDITS_BY_STATE.get(session_state, ())),
+        context_management=None,
         agent_status=AgentStatus(
             state=state,
             state_since_ms=facts.state_since_ms if facts.state_since_ms is not None else now_ms,

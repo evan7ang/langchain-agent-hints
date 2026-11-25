@@ -8,10 +8,12 @@
 
 ## 1. 总览
 
-协议定义两个通道：
+协议有三种请求类型，外加一条带外状态通道：
 
-1. **带内**——每条主链 LLM 请求携带一个 `AgentHint` 对象，经 `X-Agent-Hint` HTTP 头传输（`schema.py` + `middleware.py`）。
-2. **带外**——`agent_status` **转换**事件，在发生当下上报给可插拔 sink（`status.py`）。
+1. **带内（普通）**——每条主链 LLM 请求携带一个 `AgentHint` 对象，经 `X-Agent-Hint` HTTP 头传输（`schema.py` + `middleware.py`）：`session` + `priority_control`（+ 合格时的 `cache_control`）。
+2. **辅助请求**——压缩摘要、标题、记忆抽取：完全不带 hint。
+3. **管理（带外生命周期）**——`pause` / `resume` / `stop` / `compact` 作为**独立 HTTP 请求**发送：`session` + `context_management`，body 为占位符（`manage.py`）。
+4. **状态事件**——`agent_status` **转换**事件，在发生当下上报给可插拔 sink（`status.py`），属于被容忍的超集通道。
 
 ## 2. 传输（带内通道）
 
@@ -25,13 +27,14 @@
 ```json
 {"session":{"session_id":"s-1","parent_session_id":null,"agent_type":"my-agent",
             "call_index":1,"epoch":0,"state":"start"},
- "context_management":{"manage_request":"false","edits":[]},
  "agent_status":{"state":"running","state_since_ms":1730000000000},
  "priority":{"level":3,"reason":"user_waiting"},
  "priority_control":{"priority":{"level":3,"reason":"user_waiting"}},
  "cache_control":{"type":"ephemeral","ttl_s":240,"msg_offset":1,
                   "range":{"end":1,"unit":"message"}}}
 ```
+
+紧凑 JSON → UTF-8 字节 → 无 padding base64url → `X-Agent-Hint` 头值。普通请求绝不携带 `context_management`；管理请求形态见 §3.5 与 §4.6。
 
 紧凑 JSON → UTF-8 字节 → 无 padding base64url → `X-Agent-Hint` 头值。
 
@@ -47,7 +50,7 @@ JSON 编码丢弃 `null`/未设置字段：**"不适用"的编码方式就是省
 | `agent_type` | string | Agent 的服务侧名称（随组合而定；子代理上报自己的名称）。 |
 | `call_index` | int ≥ 1 | 该会话内模型调用的 1 起始序号。首次从持久化消息历史播种（`1 + count(AIMessage)`），之后按会话高水位递增；压缩重写不回退。 |
 | `epoch` | int ≥ 0 | 会话的上下文代际计数。消息前缀被重写时递增（历史缩短或首消息变化——summarization 信号）。进程内事实（重启清零）。 |
-| `state` | `start` \| `pause` \| `resume` \| `stop` \| `compact` \| `append` | 逐请求的生命周期摘要，首个命中者生效：`pause`（工具/审批等待中）→ `compact`（前缀刚被重写）→ `resume`（放行后的首条请求）→ `start`（根会话首请求）→ `append`（默认）。`stop` 留给带外事件通道：跑完一轮没有收尾请求。取内部状态机，不取折叠后的 `agent_status` 值。 |
+| `state` | `start` \| `append`（普通）/ `pause` \| `resume` \| `stop` \| `compact`（管理） | 逐请求生命周期：普通请求只有 `start`（根会话首个被接受的调用）或 `append`（其余全部）。生命周期动词只出现在管理请求（§4.6）。 |
 | `parent_session_id` | string \| null | 根会话显式 `null`；子（子代理）请求为父会话 id。 |
 | `derivation` | object | 仅在子请求出现。见 3.2。 |
 
@@ -76,20 +79,22 @@ JSON 编码丢弃 `null`/未设置字段：**"不适用"的编码方式就是省
 - `priority_control`——同一份值的规范位置：`{"priority": {"level": n, "reason": s}}`。两块内容一致；顶层 `priority` 作为兼容镜像保留。优先级关闭时两块一起省略。
 - `strict_priority`——**保留给可信控制面；普通 Agent 永不发射。** 仅当组合显式注入（构造参数）时才会序列化，绝不从 Agent 事实推导。
 
-### 3.5 `context_management`（恒存在）
+### 3.5 `context_management`（仅管理请求）
 
 ```json
-{"manage_request": "false", "edits": []}
+{"manage_request": true, "edits": [{"type": "offload", "target": "session"}]}
 ```
 
-`manage_request` 恒为 `"false"`：本 harness 不发起纯管理请求，edits 只表达随本请求附带的上下文意图。`edits` 由 `session.state` 展开：
+普通请求**必须省略该块**。它只出现在管理请求上：`manage_request` 是 JSON 布尔 `true`，恰好携带一条 edit，`target` 为 `session`。edit 由动词推导：
 
-| `session.state` | `edits` |
+| 动词 | `edits[].type` |
 | --- | --- |
-| `pause` | `[{"type": "offload", "target": "session"}]` |
-| `resume` | `[{"type": "prefetch", "target": "session"}]` |
-| `compact` | `[{"type": "evict", "target": "session"}]` |
-| `start` / `append` | `[]` |
+| `pause` | `offload` |
+| `resume` | `prefetch` |
+| `stop` | `evict` |
+| `compact` | `evict` |
+
+`compact` 管理请求携带**旧** epoch；紧随其后的普通请求携带 `epoch + 1`，并抑制一轮 cache 声明。`HttpManageRequestClient` 以占位 body（`{"model": ..., "messages": [], "stream": false}`）发送管理 hint，绝不把响应当作推理结果（协议 §8.3）。
 
 ### 3.6 `cache_control`
 
@@ -117,6 +122,28 @@ JSON 编码丢弃 `null`/未设置字段：**"不适用"的编码方式就是省
 3. hint 上 `agent_status.state` 恒为 `running`；`state_since_ms` 是被追踪的转换时刻（回退：请求准备墙钟）。
 4. 根请求携带 `parent_session_id: null`、不携带 `derivation`；子请求携带 `parent_session_id` + `derivation`，`join` 按 §3.2 显式给出。
 5. 头合并为增量式：上游中间件已设置的 `extra_headers` 全部保留；`X-Agent-Hint` 最后新增/更新。
+6. `session.state` 只有 `start` / `append`；普通 hint 绝不包含 `context_management`。
+
+### 4.6 管理请求（生命周期通道）
+
+配置了 `HttpManageRequestClient` 时，中间件发送：
+
+| 动词 | 本 harness 的触发时机 | `call_index` |
+| --- | --- | --- |
+| `resume` | 接手/恢复的会话首次普通请求之前（历史已存在），或组合调用 `send_manage("pause", ...)` 之后 | 即将发生的调用 |
+| `compact` | 中间件观测到已提交的前缀重写之后 | 被重写的那一步（`call_index - 1`） |
+| `pause` | **无自动触发**——组合在真实的"离开/空闲"信号上调用 `send_manage("pause", ...)` | 最近一次调用 |
+| `stop` | **无自动触发**——组合在销毁/归档时调用 `send_manage("stop", ...)` | 最近一次调用 |
+
+自动动词是 harness 能在请求边界观测到的那些。一轮结束**不是** pause，任务完成**不是** stop（对话线程在两者之后仍然存在），因此这两个动词保留为组合的显式决策。未配置管理客户端时，中间件即 L1：只发普通请求。
+
+传输规则（协议 §8.3/§8.4）：
+
+- body 为占位符 `{"model": ..., "messages": [], "stream": false}`；
+- 一个 `X-Agent-Hint` 头携带 `session` + `context_management`；
+- 会话内串行；下一条普通请求等待该锁；
+- 只有 `resume` 对 408/429/5xx 重试；结果未知的变更类请求会将会话隔离，其后的普通请求以 `ManageRequestError` 失败；
+- `HTTP 2xx` 只代表"已接受"，不代表"KV 操作完成"。
 
 ## 5. 带外状态事件
 
@@ -145,4 +172,10 @@ JSON 编码丢弃 `null`/未设置字段：**"不适用"的编码方式就是省
 
 ## 7. 修订记录
 
-- **2026-11-25——四块必需字段契约。** 新增 `session.state`（六值词表；`stop` 留给事件通道）；根会话改为发送 `parent_session_id: null`；`context_management` 恒存在；`priority_control` 镜像 `priority`；`cache_control` 改单对象并携带 `msg_offset`（`= range.end`）；`pin` 不再发送。按数组形态读取的消费方需改读对象形态；内嵌 `range` 保留原有定位信息。
+- **2026-11-25——对齐 v1（解决三处硬冲突）。**
+  1. `context_management` **仅管理请求携带**：普通请求整体省略该块，`manage_request` 为 JSON 布尔 `true`，且恰好一条 edit。
+  2. 普通请求的 `session.state` 只有 `start` / `append`；生命周期动词（`pause` / `resume` / `stop` / `compact`）移到管理请求。
+  3. 管理请求是独立 HTTP 请求，body 固定为占位符 `{"model": …, "messages": [], "stream": false}`（`manage.py`）。
+
+  已提交的前缀重写现在表达为下一条普通请求的 `epoch + 1` 加一轮 cache 抑制；配置了管理客户端时，中间件还会发送对应的 `compact` 管理请求（携带旧 epoch）。
+- **2026-11-25——四块必需字段契约。** 新增 `session.state`；根会话改为发送 `parent_session_id: null`；`priority_control` 镜像 `priority`；`cache_control` 改单对象并携带 `msg_offset`（`= range.end`）；`pin` 不再发送。按数组形态读取的消费方需改读对象形态；内嵌 `range` 保留原有定位信息。

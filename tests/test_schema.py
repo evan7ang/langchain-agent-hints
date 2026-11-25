@@ -34,18 +34,19 @@ def test_encode_decode_roundtrip_is_none_free_wire() -> None:
     assert wire == {
         "session": {
             "session_id": "thread-1",
-            "agent_type": "my-agent",
             "call_index": 1,
             "epoch": 0,
+            "agent_type": "my-agent",
             "state": "start",
             "parent_session_id": None,
         },
-        "context_management": {"manage_request": "false", "edits": []},
         "agent_status": {"state": "running", "state_since_ms": 42},
         "priority": {"level": 3, "reason": "user_waiting"},
         "priority_control": {"priority": {"level": 3, "reason": "user_waiting"}},
         "cache_control": {"type": "ephemeral", "msg_offset": 1, "range": {"end": 1}},
     }
+    # `context_management` belongs to manage requests only.
+    assert "context_management" not in wire
 
 
 def test_encode_is_unpadded_base64url() -> None:
