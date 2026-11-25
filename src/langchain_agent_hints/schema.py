@@ -34,6 +34,11 @@ HINT_HEADER = "X-Agent-Hint"
 #: after an approval pause.
 AgentState = Literal["running", "pause", "resume", "finalize"]
 
+#: ``session.state`` vocabulary: the per-request lifecycle summary. ``stop`` is
+#: reserved for the out-of-band event channel (a finished turn has no closing
+#: request) and is never emitted on the header today.
+SessionState = Literal["start", "pause", "resume", "stop", "compact", "append"]
+
 #: Internal harness states before the wire fold (``tool`` -> running,
 #: ``suspend`` -> pause). Used by the status middleware only.
 InternalAgentState = Literal["running", "tool", "pause", "suspend", "finalize"]
@@ -63,6 +68,7 @@ class SessionHint:
     agent_type: str
     call_index: int
     epoch: int
+    state: SessionState = "append"
     parent_session_id: str | None = None
     derivation: DerivationHint | None = None
 
@@ -95,6 +101,29 @@ class PriorityHint:
 
 
 @dataclass(frozen=True)
+class PriorityControl:
+    """``priority_control`` block: the canonical home of ``priority``."""
+
+    priority: PriorityHint
+
+
+@dataclass(frozen=True)
+class ContextEdit:
+    """One ``context_management.edits`` entry."""
+
+    type: Literal["offload", "prefetch", "evict"]
+    target: Literal["session", "messages", "tools"] = "session"
+
+
+@dataclass(frozen=True)
+class ContextManagement:
+    """``context_management`` block: always present, empty edits by default."""
+
+    manage_request: Literal["true", "false"] = "false"
+    edits: tuple[ContextEdit, ...] = ()
+
+
+@dataclass(frozen=True)
 class CacheControlRange:
     """``cache_control.range``: effective scope of one cache directive."""
 
@@ -105,10 +134,15 @@ class CacheControlRange:
 
 @dataclass(frozen=True)
 class CacheControlHint:
-    """One ``cache_control`` entry: pin or ephemeral intent over a range."""
+    """``cache_control`` block: one ephemeral declaration over the prefix.
 
-    type: Literal["pin", "ephemeral"]
+    ``msg_offset`` is the 1-based effect point (equal to ``range.end``); the
+    legacy ``range`` form stays embedded for consumers that still read it.
+    """
+
+    type: Literal["ephemeral"]
     ttl_s: int | None = None
+    msg_offset: int | None = None
     range: CacheControlRange | None = None
 
 
@@ -120,11 +154,9 @@ DEFAULT_PRIORITY = PriorityHint(level=3, reason="user_waiting")
 #: example).
 DEFAULT_SUBAGENT_PRIORITY = PriorityHint(level=3, reason="critical_path")
 
-#: Deprecated: the cache-control guide retires ``pin`` (consumers normalize it
-#: to ``ephemeral`` and warn). Kept for explicit opt-in compatibility only;
-#: the middleware derives a guide-compliant ``ephemeral`` declaration by default.
+#: ``pin`` is retired: every declaration is an ``ephemeral`` retention window.
 DEFAULT_CACHE_CONTROL: tuple[CacheControlHint, ...] = (
-    CacheControlHint(type="pin", range=CacheControlRange(end=1)),
+    CacheControlHint(type="ephemeral", range=CacheControlRange(end=1)),
 )
 
 #: The contracted priority domain (v2): ``3`` = user-intervened
@@ -219,10 +251,12 @@ class AgentHint:
     """The complete AgentHint object sent (encoded) as ``X-Agent-Hint``."""
 
     session: SessionHint
+    context_management: ContextManagement
     agent_status: AgentStatus | None = None
     priority: PriorityHint | None = None
+    priority_control: PriorityControl | None = None
     strict_priority: PriorityHint | None = None
-    cache_control: tuple[CacheControlHint, ...] | CacheControlHint | None = None
+    cache_control: CacheControlHint | None = None
     prediction: PredictionHint | None = None
 
 
@@ -272,6 +306,35 @@ def _drop_none(value: Any) -> Any:
     return value
 
 
+def _session_state(
+    status: AgentState,
+    call_index: int,
+    has_parent: bool,
+    rewritten: bool,
+) -> SessionState:
+    """Summarize the request into the six-value ``session.state``.
+
+    Precedence mirrors the cross-harness contract: an open wait wins, then a
+    just-rewritten prefix, then the one-shot resume, then the root's first call.
+    """
+    if status == "pause":
+        return "pause"
+    if rewritten:
+        return "compact"
+    if status == "resume":
+        return "resume"
+    if call_index == 1 and not has_parent:
+        return "start"
+    return "append"
+
+
+_EDITS_BY_STATE: dict[str, tuple[ContextEdit, ...]] = {
+    "pause": (ContextEdit(type="offload"),),
+    "resume": (ContextEdit(type="prefetch"),),
+    "compact": (ContextEdit(type="evict"),),
+}
+
+
 def _fold_strict_priority(priority: PriorityHint | None) -> PriorityHint | None:
     """Control-plane ``strict_priority``: fold the level only, never the reason."""
     if priority is None:
@@ -290,6 +353,7 @@ def build_agent_hint(
     prediction: PredictionHint | None = None,
     strict_priority: PriorityHint | None = None,
     state: AgentState = "running",
+    rewritten: bool = False,
 ) -> AgentHint:
     """Build one AgentHint for a main-line model request.
 
@@ -319,29 +383,53 @@ def build_agent_hint(
         if has_parent and facts.parent_relation is not None
         else None
     )
+    session_state = _session_state(state, facts.call_index, has_parent, rewritten)
+    priority = _fold_priority(options.priority)
+    cache_control = None
+    if options.cache_control:
+        first = options.cache_control[0]
+        offset = first.msg_offset
+        if offset is None and first.range is not None:
+            offset = first.range.end
+        cache_control = CacheControlHint(
+            type=first.type,
+            ttl_s=first.ttl_s,
+            msg_offset=offset,
+            range=first.range,
+        )
     return AgentHint(
         session=SessionHint(
             session_id=facts.session_id,
             agent_type=options.agent_type,
             call_index=facts.call_index,
             epoch=facts.epoch,
+            state=session_state,
             parent_session_id=facts.parent_session_id if has_parent else None,
             derivation=derivation,
         ),
+        context_management=ContextManagement(edits=_EDITS_BY_STATE.get(session_state, ())),
         agent_status=AgentStatus(
             state=state,
             state_since_ms=facts.state_since_ms if facts.state_since_ms is not None else now_ms,
         ),
-        priority=_fold_priority(options.priority),
+        priority=priority,
+        priority_control=PriorityControl(priority=priority) if priority is not None else None,
         strict_priority=_fold_strict_priority(strict_priority),
-        cache_control=options.cache_control,
+        cache_control=cache_control,
         prediction=prediction,
     )
 
 
 def hint_to_dict(hint: AgentHint) -> dict[str, Any]:
-    """Render an AgentHint as the plain JSON-compatible dict (None-free)."""
+    """Render an AgentHint as the plain JSON-compatible dict (None-free).
+
+    ``session.parent_session_id`` is the one key that survives as an explicit
+    ``null``: the contract requires the key to exist on root sessions too.
+    """
     rendered: dict[str, Any] = _drop_none(asdict(hint))
+    session = rendered.get("session")
+    if isinstance(session, dict) and "parent_session_id" not in session:
+        session["parent_session_id"] = None
     return rendered
 
 

@@ -38,10 +38,14 @@ The protocol defines two channels:
 ### Worked example
 
 ```json
-{"session":{"session_id":"s-1","agent_type":"my-agent","call_index":1,"epoch":0},
+{"session":{"session_id":"s-1","parent_session_id":null,"agent_type":"my-agent",
+            "call_index":1,"epoch":0,"state":"start"},
+ "context_management":{"manage_request":"false","edits":[]},
  "agent_status":{"state":"running","state_since_ms":1730000000000},
  "priority":{"level":3,"reason":"user_waiting"},
- "cache_control":[{"type":"ephemeral","ttl_s":240,"range":{"end":1,"unit":"message"}}]}
+ "priority_control":{"priority":{"level":3,"reason":"user_waiting"}},
+ "cache_control":{"type":"ephemeral","ttl_s":240,"msg_offset":1,
+                  "range":{"end":1,"unit":"message"}}}
 ```
 
 Compact JSON → UTF-8 bytes → unpadded base64url → `X-Agent-Hint` header value.
@@ -49,7 +53,8 @@ Compact JSON → UTF-8 bytes → unpadded base64url → `X-Agent-Hint` header va
 ## 3. Schema
 
 JSON encoding drops `null`/unset fields: **omission is the encoding for "not
-applicable"** (e.g. root sessions carry no `parent_session_id`).
+applicable"**. `session.parent_session_id` is the one key that survives as an
+explicit `null` so consumers can always test for existence.
 
 ### 3.1 `session` (mandatory)
 
@@ -59,8 +64,9 @@ applicable"** (e.g. root sessions carry no `parent_session_id`).
 | `agent_type` | string | Serving-side name of the agent (composition-specific; subagents report their own name). |
 | `call_index` | int ≥ 1 | 1-based index of this model call within the session. Seeded from the persistent message history (`1 + count(AIMessage)`) and kept as a session high-water counter; a compaction rewrite does not rewind it. |
 | `epoch` | int ≥ 0 | Context-generation counter of the session. Bumped when the message prefix is rewritten (history shrinks or the first message changes — the summarization signal). In-process fact (restarts reset it). |
-| `parent_session_id` | string | Present only on child (subagent) requests; the parent's session id. |
-| `derivation` | object | Present only with `parent_session_id`. See 3.2. |
+| `state` | `start` \| `pause` \| `resume` \| `stop` \| `compact` \| `append` | Per-request lifecycle summary, first match wins: `pause` (open tool/approval wait) → `compact` (prefix just rewritten) → `resume` (first request after a release) → `start` (root session's first call) → `append` (default). `stop` is reserved for the out-of-band event channel: a finished turn has no closing request. Read from the internal state machine, not the folded `agent_status` value. |
+| `parent_session_id` | string \| null | Explicit `null` on root sessions; the parent's session id on child (subagent) requests. |
+| `derivation` | object | Present only on child requests. See 3.2. |
 
 ### 3.2 `session.derivation`
 
@@ -79,7 +85,7 @@ applicable"** (e.g. root sessions carry no `parent_session_id`).
 | `reason` | string | **Event channel only** — not emitted in the request header. |
 | `tools` | array | **Event channel only** — `[{name, call_id?, child_session_id?}]` on the out-of-band event. |
 
-### 3.4 `priority` / `strict_priority`
+### 3.4 `priority` / `priority_control` / `strict_priority`
 
 `{level: int, reason: string}`. Levels follow the protocol examples: `3` =
 interactive work waiting on the user (`user_waiting`); sync-joined children
@@ -94,17 +100,38 @@ sit on the parent's critical path (`critical_path`).
   continuation or a subagent run is `1/critical_path`; batch runs are
   `1/background`. Explicit composition/service values are normalized by the
   same reason rule.
+- `priority_control` — the canonical home of the same value:
+  `{"priority": {"level": n, "reason": s}}`. Both blocks carry identical
+  content; the top-level `priority` is retained as a compatibility mirror.
+  Both are omitted together when priority is disabled.
 - `strict_priority` — **reserved for a trusted control plane; ordinary agents
   never emit it.** It is only serialized when the composition injects it
   explicitly (constructor argument), never derived from agent facts.
 
-### 3.5 `cache_control`
-
-Implements `CACHE_CONTROL_IMPLEMENTATION_GUIDE.md`. The field carries **one**
-declaration:
+### 3.5 `context_management` (always present)
 
 ```json
-{"type": "ephemeral", "ttl_s": 240, "range": {"end": 12, "unit": "message"}}
+{"manage_request": "false", "edits": []}
+```
+
+`manage_request` is always `"false"`: this harness never issues a pure
+management request; edits only express the context intent carried along with
+this request. `edits` expands from `session.state`:
+
+| `session.state` | `edits` |
+| --- | --- |
+| `pause` | `[{"type": "offload", "target": "session"}]` |
+| `resume` | `[{"type": "prefetch", "target": "session"}]` |
+| `compact` | `[{"type": "evict", "target": "session"}]` |
+| `start` / `append` | `[]` |
+
+### 3.6 `cache_control`
+
+Implements `CACHE_CONTROL_IMPLEMENTATION_GUIDE.md`. The field carries **one**
+declaration as a single object:
+
+```json
+{"type": "ephemeral", "ttl_s": 240, "msg_offset": 12, "range": {"end": 12, "unit": "message"}}
 ```
 
 - `type` — `ephemeral` only (`pin` is retired; consumers normalize it and warn).
@@ -112,15 +139,18 @@ declaration:
   `gap` is the next-tool expected duration (p90), else the last inter-call
   interval, else a 300 s fallback. The consumer never renews it, so every
   request re-declares.
+- `msg_offset` — the 1-based message index at which the declaration takes
+  effect; equal to `range.end`.
 - `range.end` — the **logical input count** `[system?] + messages` (1-based,
   inclusive), never the append-only history length; `range.unit` is
-  `message`.
+  `message`. The embedded `range` is retained for consumers that still read
+  the pre-single-object form.
 
 The implementation omits the declaration when the prefix is below one engine
 cache block (128 tokens), when the message prefix was rewritten (compaction or
 branch: the epoch bump), or when the model/tool set changed that round.
 
-### 3.6 `prediction` (measured in-process)
+### 3.7 `prediction` (measured in-process)
 
 Serving-side estimates: `latency_ms`, `remaining_calls`, `output_tokens`,
 `interval_ms`, `remaining_time_ms`, `expected_resume_s`,
@@ -141,8 +171,8 @@ per-field overrides supplied to the middleware win over measured values.
    never hinted.
 3. `agent_status.state` on the hint is always `running`; `state_since_ms` is
    the tracked transition instant (fallback: request-preparation wall clock).
-4. Root requests omit lineage fields entirely; child requests carry
-   `parent_session_id` + `derivation` with `join` explicit per §3.2.
+4. Root requests carry `parent_session_id: null` and no `derivation`; child
+   requests carry the parent id + `derivation` with `join` explicit per §3.2.
 5. The header merge is additive: existing `extra_headers` set by upstream
    middleware are preserved; `X-Agent-Hint` is added/updated last.
 
@@ -181,3 +211,13 @@ serialized per-session `seq`; cross-process resume tolerance comes from
 - `derivation.fork_point` (§3.2) — requires a message-index contract.
 - `prediction` measurements are process-local: a restart starts a fresh
   rolling window unless `persist_path` carries the aggregates.
+
+## 7. Revision notes
+
+- **2026-11-25 — four-block field contract.** `session.state` added (six-value
+  vocabulary; `stop` reserved for the event channel); root sessions now send
+  `parent_session_id: null`; `context_management` is always present;
+  `priority_control` mirrors `priority`; `cache_control` is a single object and
+  carries `msg_offset` (`= range.end`); `pin` is no longer emitted.
+  Consumers that read the array form must read the object form instead; the
+  embedded `range` keeps the previous locator.

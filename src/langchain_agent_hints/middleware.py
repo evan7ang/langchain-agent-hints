@@ -563,6 +563,7 @@ class AgentHintsMiddleware(AgentMiddleware):
             prediction=prediction,
             strict_priority=self._strict_priority,
             state=status_state,
+            rewritten=rewritten,
         )
 
         model_settings = dict(request.model_settings)

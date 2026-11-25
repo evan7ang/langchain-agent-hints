@@ -69,13 +69,15 @@ result = agent.invoke(
 
 ```json
 {
-  "session": {"session_id": "session-42", "agent_type": "my-agent", "call_index": 3, "epoch": 0},
+  "session": {"session_id": "session-42", "parent_session_id": null,
+              "agent_type": "my-agent", "call_index": 3, "epoch": 0,
+              "state": "append"},
+  "context_management": {"manage_request": "false", "edits": []},
   "agent_status": {"state": "running", "state_since_ms": 1730000000000},
   "priority": {"level": 3, "reason": "user_waiting"},
-  "cache_control": [
-    {"type": "ephemeral", "ttl_s": 240,
-     "range": {"end": 2, "unit": "message"}}
-  ]
+  "priority_control": {"priority": {"level": 3, "reason": "user_waiting"}},
+  "cache_control": {"type": "ephemeral", "ttl_s": 240, "msg_offset": 2,
+                    "range": {"end": 2, "unit": "message"}}
 }
 ```
 
@@ -104,10 +106,11 @@ agent = create_deep_agent(
 
 | 块 | 内容 | 来源 |
 | --- | --- | --- |
-| `session` | `session_id`、`agent_type`、`call_index`、`epoch`、可选 `parent_session_id` + `derivation` | `thread_id`、构造参数、持久化消息历史 |
+| `session` | `session_id`、`parent_session_id`（根会话显式 `null`）、`agent_type`、`call_index`、`epoch`、`state`、可选 `derivation` | `thread_id`、构造参数、持久化消息历史 |
+| `context_management` | 恒存在：`manage_request: "false"`，edits 由 `session.state` 展开（`pause → offload`、`resume → prefetch`、`compact → evict`，其余为空） | `session.state` |
 | `agent_status` | 请求时刻的生命周期快照：默认 `running`；停驻（含工具等待）为 `pause`；放行首条为 `resume` | 中间件观测 + 共享 `RunSignals` |
-| `priority` | 级别 + 审计原因。只有 `user_waiting` 是 3；`critical_path`/`background` 是 1。自动：人类消息/审批恢复 → `3/user_waiting`；工具续接/子 Agent → `1/critical_path`；`run_mode="batch"` → `1/background` | 请求触发源 + 共享 `RunSignals`；显式/服务值按 reason 归一 |
-| `cache_control` | 单条 `ephemeral` + 显式 TTL（`clamp(gap×2, 60, 3600)`）；`range.end` = 逻辑输入条数（`[system?] + messages`） | 按 cache-control 指南逐请求推导（下一工具 p90 → 最近间隔 → 300s；<128 token、前缀重写、模型/工具集变化当轮不发） |
+| `priority` / `priority_control` | 级别 + 审计原因，同时写入兼容的顶层块与规范位置 `priority_control.priority`。只有 `user_waiting` 是 3；`critical_path`/`background` 是 1。自动：人类消息/审批恢复 → `3/user_waiting`；工具续接/子 Agent → `1/critical_path`；`run_mode="batch"` → `1/background` | 请求触发源 + 共享 `RunSignals`；显式/服务值按 reason 归一 |
+| `cache_control` | 单个 `ephemeral` **对象** + 显式 TTL（`clamp(gap×2, 60, 3600)`）；`msg_offset` = `range.end` = 逻辑输入条数（`[system?] + messages`） | 按 cache-control 指南逐请求推导（下一工具 p90 → 最近间隔 → 300s；<128 token、前缀重写、模型/工具集变化当轮不发） |
 | `prediction` | 实测服务预估：`latency_ms`、`output_tokens`、`interval_ms`、`remaining_calls`、`remaining_time_ms`、`next_action` | 插件内观测引擎（滚动 p90）；样本不足时省略 |
 | `strict_priority` | 保留给可信控制面 | 仅构造参数显式注入；普通 Agent 永不生成 |
 
@@ -118,6 +121,7 @@ agent = create_deep_agent(
 - 无 `thread_id` → 不发 hint、不发状态事件（身份必传）。
 - `call_index` 是会话级高水位计数：首次从检查点消息历史播种（`1 + count(AIMessage)`），之后每次 hint 请求 +1；压缩重写不回退。
 - `epoch` 在消息前缀被重写时递增（summarization 信号）。
+- `session.state` 是逐请求的生命周期摘要：工具/审批等待中 `pause`，重写后首请求 `compact`，放行请求 `resume`，根会话首请求 `start`，其余 `append`。`stop` 留给带外事件通道（跑完一轮没有收尾请求）。
 - 只有流经 `wrap_model_call` 的请求携带 hint；旁路模型调用（不经中间件链）不会发射。若辅助调用（如压缩摘要）确实流经中间件链，用 `suppress_hints()` 包住：不发 header、不发状态转换。
 
 ## 状态事件

@@ -23,17 +23,21 @@
 ### 示例
 
 ```json
-{"session":{"session_id":"s-1","agent_type":"my-agent","call_index":1,"epoch":0},
+{"session":{"session_id":"s-1","parent_session_id":null,"agent_type":"my-agent",
+            "call_index":1,"epoch":0,"state":"start"},
+ "context_management":{"manage_request":"false","edits":[]},
  "agent_status":{"state":"running","state_since_ms":1730000000000},
  "priority":{"level":3,"reason":"user_waiting"},
- "cache_control":[{"type":"ephemeral","ttl_s":240,"range":{"end":1,"unit":"message"}}]}
+ "priority_control":{"priority":{"level":3,"reason":"user_waiting"}},
+ "cache_control":{"type":"ephemeral","ttl_s":240,"msg_offset":1,
+                  "range":{"end":1,"unit":"message"}}}
 ```
 
 紧凑 JSON → UTF-8 字节 → 无 padding base64url → `X-Agent-Hint` 头值。
 
 ## 3. Schema
 
-JSON 编码丢弃 `null`/未设置字段：**"不适用"的编码方式就是省略**（如根会话不携带 `parent_session_id`）。
+JSON 编码丢弃 `null`/未设置字段：**"不适用"的编码方式就是省略**。唯一例外是 `session.parent_session_id`：根会话显式发送 `null`，保证消费方可以始终按键存在判定。
 
 ### 3.1 `session`（必传）
 
@@ -43,8 +47,9 @@ JSON 编码丢弃 `null`/未设置字段：**"不适用"的编码方式就是省
 | `agent_type` | string | Agent 的服务侧名称（随组合而定；子代理上报自己的名称）。 |
 | `call_index` | int ≥ 1 | 该会话内模型调用的 1 起始序号。首次从持久化消息历史播种（`1 + count(AIMessage)`），之后按会话高水位递增；压缩重写不回退。 |
 | `epoch` | int ≥ 0 | 会话的上下文代际计数。消息前缀被重写时递增（历史缩短或首消息变化——summarization 信号）。进程内事实（重启清零）。 |
-| `parent_session_id` | string | 仅子（子代理）请求携带；指向父会话 id。 |
-| `derivation` | object | 与 `parent_session_id` 同时出现。见 3.2。 |
+| `state` | `start` \| `pause` \| `resume` \| `stop` \| `compact` \| `append` | 逐请求的生命周期摘要，首个命中者生效：`pause`（工具/审批等待中）→ `compact`（前缀刚被重写）→ `resume`（放行后的首条请求）→ `start`（根会话首请求）→ `append`（默认）。`stop` 留给带外事件通道：跑完一轮没有收尾请求。取内部状态机，不取折叠后的 `agent_status` 值。 |
+| `parent_session_id` | string \| null | 根会话显式 `null`；子（子代理）请求为父会话 id。 |
+| `derivation` | object | 仅在子请求出现。见 3.2。 |
 
 ### 3.2 `session.derivation`
 
@@ -63,28 +68,45 @@ JSON 编码丢弃 `null`/未设置字段：**"不适用"的编码方式就是省
 | `reason` | string | **仅事件通道**，请求头不发。 |
 | `tools` | array | **仅事件通道**：`[{name, call_id?, child_session_id?}]`。 |
 
-### 3.4 `priority` / `strict_priority`
+### 3.4 `priority` / `priority_control` / `strict_priority`
 
 `{level: int, reason: string}`。级别遵循协议示例：`3` = 等待用户的交互型工作（`user_waiting`）；sync-join 的子代理位于父关键路径上（`critical_path`）。
 
 - `priority`——Agent 自身的服务优先级。简化契约按 reason 定档：只有 `user_waiting` 是 `3`；`critical_path` / `background` 是 `1`。审计 reason 的后缀（如 `background: context_compaction`）归一成基础词。参考实现按请求触发源推导：人类消息/审批恢复 → `3/user_waiting`；工具续接或子 Agent → `1/critical_path`；批量运行 → `1/background`。显式配置/服务值也按同一 reason 规则归一。
+- `priority_control`——同一份值的规范位置：`{"priority": {"level": n, "reason": s}}`。两块内容一致；顶层 `priority` 作为兼容镜像保留。优先级关闭时两块一起省略。
 - `strict_priority`——**保留给可信控制面；普通 Agent 永不发射。** 仅当组合显式注入（构造参数）时才会序列化，绝不从 Agent 事实推导。
 
-### 3.5 `cache_control`
-
-实现 `CACHE_CONTROL_IMPLEMENTATION_GUIDE.md`，只带**一条**声明：
+### 3.5 `context_management`（恒存在）
 
 ```json
-{"type": "ephemeral", "ttl_s": 240, "range": {"end": 12, "unit": "message"}}
+{"manage_request": "false", "edits": []}
+```
+
+`manage_request` 恒为 `"false"`：本 harness 不发起纯管理请求，edits 只表达随本请求附带的上下文意图。`edits` 由 `session.state` 展开：
+
+| `session.state` | `edits` |
+| --- | --- |
+| `pause` | `[{"type": "offload", "target": "session"}]` |
+| `resume` | `[{"type": "prefetch", "target": "session"}]` |
+| `compact` | `[{"type": "evict", "target": "session"}]` |
+| `start` / `append` | `[]` |
+
+### 3.6 `cache_control`
+
+实现 `CACHE_CONTROL_IMPLEMENTATION_GUIDE.md`，只带**一条**声明，且为**单对象**：
+
+```json
+{"type": "ephemeral", "ttl_s": 240, "msg_offset": 12, "range": {"end": 12, "unit": "message"}}
 ```
 
 - `type`——只用 `ephemeral`（`pin` 已退役，消费方会归一化并告警）。
 - `ttl_s`——必填；`clamp(gap × 2, 60, 3600)`，`gap` 取下一工具预计耗时（p90），否则最近调用间隔，否则 300s 兜底。消费方不续期，故每请求都要重新声明。
-- `range.end`——**逻辑输入条数** `[system?] + messages`（1-based，含），绝不用 append-only 历史长度；`range.unit` 为 `message`。
+- `msg_offset`——1-based 的声明生效消息序号，与 `range.end` 同值。
+- `range.end`——**逻辑输入条数** `[system?] + messages`（1-based，含），绝不用 append-only 历史长度；`range.unit` 为 `message`。内嵌 `range` 保留给仍按旧形态读取的消费方。
 
 前缀不足一个 128-token 缓存块、消息前缀被重写（压缩/分支，epoch 递增）或模型/工具集变化的当轮都不发声明。
 
-### 3.6 `prediction`（插件内实测）
+### 3.7 `prediction`（插件内实测）
 
 服务端预估：`latency_ms`、`remaining_calls`、`output_tokens`、`interval_ms`、`remaining_time_ms`、`expected_resume_s`、`next_action: {state, tools?: [{name, expected_duration_s?}], prob?}`。由插件内观测引擎填充（按 agent_type 滚动统计，每指标取单值——最近秩分位，默认 p90）。该对象允许部分字段：样本不足的指标省略，省略即"无预估"；构造参数中的静态值按字段覆盖实测值。
 
@@ -93,7 +115,7 @@ JSON 编码丢弃 `null`/未设置字段：**"不适用"的编码方式就是省
 1. **身份必传**：无 `thread_id` 的请求不携带 hint。
 2. **仅主链**：只有流经中间件链（`wrap_model_call` / `awrap_model_call`）的请求被 hint。旁路模型调用（如 summarization 中间件自身的请求）绝不发射。
 3. hint 上 `agent_status.state` 恒为 `running`；`state_since_ms` 是被追踪的转换时刻（回退：请求准备墙钟）。
-4. 根请求完全省略世系字段；子请求携带 `parent_session_id` + `derivation`，`join` 按 §3.2 显式给出。
+4. 根请求携带 `parent_session_id: null`、不携带 `derivation`；子请求携带 `parent_session_id` + `derivation`，`join` 按 §3.2 显式给出。
 5. 头合并为增量式：上游中间件已设置的 `extra_headers` 全部保留；`X-Agent-Hint` 最后新增/更新。
 
 ## 5. 带外状态事件
@@ -120,3 +142,7 @@ JSON 编码丢弃 `null`/未设置字段：**"不适用"的编码方式就是省
 - `strict_priority`（§3.4）——保留给可信控制面；仅在显式注入时发送。
 - `derivation.fork_point`（§3.2）——需要消息序号契约。
 - `prediction` 的观测为进程内：重启后从新的滚动窗口开始，除非 `persist_path` 携带聚合。
+
+## 7. 修订记录
+
+- **2026-11-25——四块必需字段契约。** 新增 `session.state`（六值词表；`stop` 留给事件通道）；根会话改为发送 `parent_session_id: null`；`context_management` 恒存在；`priority_control` 镜像 `priority`；`cache_control` 改单对象并携带 `msg_offset`（`= range.end`）；`pin` 不再发送。按数组形态读取的消费方需改读对象形态；内嵌 `range` 保留原有定位信息。

@@ -91,13 +91,15 @@ Requests then carry a header such as (base64url-decoded for readability):
 
 ```json
 {
-  "session": {"session_id": "session-42", "agent_type": "my-agent", "call_index": 3, "epoch": 0},
+  "session": {"session_id": "session-42", "parent_session_id": null,
+              "agent_type": "my-agent", "call_index": 3, "epoch": 0,
+              "state": "append"},
+  "context_management": {"manage_request": "false", "edits": []},
   "agent_status": {"state": "running", "state_since_ms": 1730000000000},
   "priority": {"level": 3, "reason": "user_waiting"},
-  "cache_control": [
-    {"type": "ephemeral", "ttl_s": 240,
-     "range": {"end": 2, "unit": "message"}}
-  ]
+  "priority_control": {"priority": {"level": 3, "reason": "user_waiting"}},
+  "cache_control": {"type": "ephemeral", "ttl_s": 240, "msg_offset": 2,
+                    "range": {"end": 2, "unit": "message"}}
 }
 ```
 
@@ -127,10 +129,11 @@ gateway via `OPENAI_BASE_URL`.
 
 | Block | Content | Source |
 | --- | --- | --- |
-| `session` | `session_id`, `agent_type`, `call_index`, `epoch`, optional `parent_session_id` + `derivation` | `thread_id`, constructor options, persistent message history |
+| `session` | `session_id`, `parent_session_id` (explicit `null` on roots), `agent_type`, `call_index`, `epoch`, `state`, optional `derivation` | `thread_id`, constructor options, persistent message history |
+| `context_management` | always present: `manage_request: "false"` and edits expanded from `session.state` (`pause → offload`, `resume → prefetch`, `compact → evict`, else empty) | `session.state` |
 | `agent_status` | wire snapshot: `running` by default, `pause` while parked (including a tool wait), `resume` on the first request after a release | middleware observation + shared `RunSignals` |
-| `priority` | level + audit reason. Only `user_waiting` is 3; `critical_path`/`background` are 1. Auto: human message / approval resume → `3/user_waiting`; tool continuation/subagent → `1/critical_path`; `run_mode="batch"` → `1/background` | request trigger + shared `RunSignals`; explicit/service values normalized by reason |
-| `cache_control` | one `ephemeral` declaration with an explicit TTL (`clamp(gap*2, 60, 3600)`); `range.end` = logical input count (`[system?] + messages`) | per-request derivation from the cache-control guide (next-tool p90 → last interval → 300 s fallback; omitted below 128 tokens, on prefix rewrite, or on a model/tool-set change) |
+| `priority` / `priority_control` | level + audit reason in both the legacy top-level block and the canonical `priority_control.priority`. Only `user_waiting` is 3; `critical_path`/`background` are 1. Auto: human message / approval resume → `3/user_waiting`; tool continuation/subagent → `1/critical_path`; `run_mode="batch"` → `1/background` | request trigger + shared `RunSignals`; explicit/service values normalized by reason |
+| `cache_control` | one `ephemeral` **object** with an explicit TTL (`clamp(gap*2, 60, 3600)`); `msg_offset` = `range.end` = logical input count (`[system?] + messages`) | per-request derivation from the cache-control guide (next-tool p90 → last interval → 300 s fallback; omitted below 128 tokens, on prefix rewrite, or on a model/tool-set change) |
 | `prediction` | measured serving estimates: `latency_ms`, `output_tokens`, `interval_ms`, `remaining_calls`, `remaining_time_ms`, `next_action` | in-plugin observation engine (rolling p90); omitted until enough samples |
 | `strict_priority` | reserved for a trusted control plane | constructor injection only; ordinary agents never set it |
 
@@ -142,6 +145,10 @@ Key emission rules:
 - `call_index` is a session high-water counter seeded from the checkpointer-persisted message history
   (`1 + count(AIMessage)`); a compaction rewrite does not rewind it.
 - `epoch` bumps when the message prefix is rewritten (summarization signal).
+- `session.state` summarizes the request: `pause` while a tool/approval wait is open,
+  `compact` on the first request after a rewrite, `resume` on the released request,
+  `start` on a root session's first call, `append` otherwise. `stop` is reserved for
+  the out-of-band event channel (a finished turn has no closing request).
 - Only requests flowing through `wrap_model_call` are hinted; auxiliary
   model calls that bypass the middleware chain are not. For an auxiliary call
   that does flow through the chain (e.g. a compaction summary), wrap it in
