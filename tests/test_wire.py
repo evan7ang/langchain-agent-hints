@@ -34,7 +34,8 @@ def _assert_hint_shape(record: dict[str, Any], *, thread_id: str, agent_type: st
     assert hint["session"]["agent_type"] == agent_type
     assert hint["session"]["call_index"] == 1
     assert hint["session"]["epoch"] == 0
-    assert "parent_session_id" not in hint["session"]
+    assert hint["session"]["state"] == "start"
+    assert hint["session"]["parent_session_id"] is None
     assert "derivation" not in hint["session"]
     assert hint["agent_status"]["state"] == "running"
     assert hint["priority"] == {"level": 3, "reason": "user_waiting"}
@@ -120,10 +121,9 @@ def test_long_prefix_declares_ephemeral_cache(stub_server) -> None:
     )
     records = _records(capture)
     hint = independent_decode(records[0]["headers"][HINT_HEADER.lower()])
-    assert hint["cache_control"] == [
-        {
-            "type": "ephemeral",
-            "ttl_s": 600,  # cold start: 300 s fallback * 2
-            "range": {"end": 2, "unit": "message"},  # system + user
-        }
-    ]
+    assert hint["cache_control"] == {
+        "type": "ephemeral",
+        "ttl_s": 600,  # cold start: 300 s fallback * 2
+        "msg_offset": 2,
+        "range": {"end": 2, "unit": "message"},  # system + user
+    }

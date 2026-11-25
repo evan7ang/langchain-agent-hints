@@ -82,7 +82,10 @@ def test_two_calls_hinted_with_state_derived_call_index(tmp_path: Path) -> None:
         "agent_type": "test-agent",
         "call_index": 1,
         "epoch": 0,
+        "state": "start",
+        "parent_session_id": None,
     }
+    assert second["session"]["state"] == "append"
     assert second["session"]["call_index"] == 2
     assert first["agent_status"]["state"] == "running"
     # A human message is user-intervened; a tool-result continuation is
@@ -93,7 +96,7 @@ def test_two_calls_hinted_with_state_derived_call_index(tmp_path: Path) -> None:
     assert "cache_control" not in first
     # Below the observation min_samples threshold the measured block is omitted.
     assert "prediction" not in first and "strict_priority" not in first
-    assert "parent_session_id" not in first["session"]
+    assert first["session"]["parent_session_id"] is None
     assert "derivation" not in first["session"]
 
     # The full status lifecycle of the plain round rode along.
@@ -126,7 +129,7 @@ def test_custom_options_reach_the_wire(tmp_path: Path) -> None:
     hints = [independent_decode(encoded) for encoded in hinted_headers(spy)]
     assert hints[0]["session"]["agent_type"] == "test-agent"
     assert hints[0]["priority"] == {"level": 1, "reason": "deadline"}
-    assert hints[0]["cache_control"] == [{"type": "ephemeral", "ttl_s": 600}]
+    assert hints[0]["cache_control"] == {"type": "ephemeral", "ttl_s": 600}
 
 
 def test_async_path_hints_identically(tmp_path: Path) -> None:

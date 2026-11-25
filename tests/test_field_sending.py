@@ -73,7 +73,7 @@ def test_root_session_omits_lineage(monkeypatch) -> None:
     monkeypatch.setattr(middleware_mod, "ensure_config", lambda: _config(thread_id="t"))
     mw = AgentHintsMiddleware(agent_type="office-agent")
     wire = _wire(_Request([HumanMessage(content="go")]), mw)
-    assert "parent_session_id" not in wire["session"]
+    assert wire["session"]["parent_session_id"] is None
     assert "derivation" not in wire["session"]
     assert wire["priority"] == {"level": 3, "reason": "user_waiting"}
 
@@ -114,10 +114,11 @@ def test_prediction_priority_cache_are_emitted_from_real_facts(monkeypatch) -> N
 
     assert wire["agent_status"]["state"] == "running"
     assert wire["priority"] == {"level": 1, "reason": "critical_path"}  # tool continuation
-    assert wire["cache_control"][0]["type"] == "ephemeral"
-    assert 60 <= wire["cache_control"][0]["ttl_s"] <= 3600
-    assert wire["cache_control"][0]["range"]["end"] == 3  # system + 2 messages
-    assert wire["cache_control"][0]["range"]["unit"] == "message"
+    assert wire["cache_control"]["type"] == "ephemeral"
+    assert 60 <= wire["cache_control"]["ttl_s"] <= 3600
+    assert wire["cache_control"]["range"]["end"] == 3  # system + 2 messages
+    assert wire["cache_control"]["range"]["unit"] == "message"
+    assert wire["cache_control"]["msg_offset"] == 3
 
 
 def test_fork_is_not_emitted_by_this_harness(monkeypatch) -> None:
