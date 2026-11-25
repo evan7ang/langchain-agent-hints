@@ -15,12 +15,18 @@ endpoint.
 
 ## 1. Overview
 
-The protocol defines two channels:
+The protocol has three request kinds plus an out-of-band status channel:
 
-1. **In-band** — one `AgentHint` object per main-line LLM request, carried as
-   the `X-Agent-Hint` HTTP header (`schema.py` + `middleware.py`).
-2. **Out-of-band** — `agent_status` **transition** events, reported as they
-   happen to a pluggable sink (`status.py`).
+1. **In-band (ordinary)** — one `AgentHint` object per main-line LLM request,
+   carried as the `X-Agent-Hint` HTTP header (`schema.py` + `middleware.py`):
+   `session` + `priority_control` (+ `cache_control` when qualified).
+2. **Auxiliary** — compaction summaries, titles, memory extraction: no hint at
+   all.
+3. **Manage (out-of-band lifecycle)** — `pause` / `resume` / `stop` /
+   `compact` delivered as their own HTTP request: `session` +
+   `context_management`, with a placeholder body (`manage.py`).
+4. **Status events** — `agent_status` **transition** events, reported as they
+   happen to a pluggable sink (`status.py`). A tolerated superset channel.
 
 ## 2. Transport (in-band channel)
 
@@ -40,7 +46,6 @@ The protocol defines two channels:
 ```json
 {"session":{"session_id":"s-1","parent_session_id":null,"agent_type":"my-agent",
             "call_index":1,"epoch":0,"state":"start"},
- "context_management":{"manage_request":"false","edits":[]},
  "agent_status":{"state":"running","state_since_ms":1730000000000},
  "priority":{"level":3,"reason":"user_waiting"},
  "priority_control":{"priority":{"level":3,"reason":"user_waiting"}},
@@ -49,6 +54,8 @@ The protocol defines two channels:
 ```
 
 Compact JSON → UTF-8 bytes → unpadded base64url → `X-Agent-Hint` header value.
+Ordinary requests never carry `context_management`; see §3.5 and §4.6 for the
+manage request shape.
 
 ## 3. Schema
 
@@ -64,7 +71,7 @@ explicit `null` so consumers can always test for existence.
 | `agent_type` | string | Serving-side name of the agent (composition-specific; subagents report their own name). |
 | `call_index` | int ≥ 1 | 1-based index of this model call within the session. Seeded from the persistent message history (`1 + count(AIMessage)`) and kept as a session high-water counter; a compaction rewrite does not rewind it. |
 | `epoch` | int ≥ 0 | Context-generation counter of the session. Bumped when the message prefix is rewritten (history shrinks or the first message changes — the summarization signal). In-process fact (restarts reset it). |
-| `state` | `start` \| `pause` \| `resume` \| `stop` \| `compact` \| `append` | Per-request lifecycle summary, first match wins: `pause` (open tool/approval wait) → `compact` (prefix just rewritten) → `resume` (first request after a release) → `start` (root session's first call) → `append` (default). `stop` is reserved for the out-of-band event channel: a finished turn has no closing request. Read from the internal state machine, not the folded `agent_status` value. |
+| `state` | `start` \| `append` (ordinary) / `pause` \| `resume` \| `stop` \| `compact` (manage) | Per-request lifecycle: ordinary requests are only `start` (a root session's first accepted call) or `append` (everything else). Lifecycle verbs appear only on manage requests (§4.6). |
 | `parent_session_id` | string \| null | Explicit `null` on root sessions; the parent's session id on child (subagent) requests. |
 | `derivation` | object | Present only on child requests. See 3.2. |
 
@@ -108,22 +115,28 @@ sit on the parent's critical path (`critical_path`).
   never emit it.** It is only serialized when the composition injects it
   explicitly (constructor argument), never derived from agent facts.
 
-### 3.5 `context_management` (always present)
+### 3.5 `context_management` (manage requests only)
 
 ```json
-{"manage_request": "false", "edits": []}
+{"manage_request": true, "edits": [{"type": "offload", "target": "session"}]}
 ```
 
-`manage_request` is always `"false"`: this harness never issues a pure
-management request; edits only express the context intent carried along with
-this request. `edits` expands from `session.state`:
+Ordinary requests **must omit this block**. It appears only on a manage
+request, where `manage_request` is the JSON boolean `true`, exactly one edit is
+carried, and `target` is `session`. The edit is derived from the verb:
 
-| `session.state` | `edits` |
+| verb | `edits[].type` |
 | --- | --- |
-| `pause` | `[{"type": "offload", "target": "session"}]` |
-| `resume` | `[{"type": "prefetch", "target": "session"}]` |
-| `compact` | `[{"type": "evict", "target": "session"}]` |
-| `start` / `append` | `[]` |
+| `pause` | `offload` |
+| `resume` | `prefetch` |
+| `stop` | `evict` |
+| `compact` | `evict` |
+
+A `compact` manage request carries the **old** epoch; the following ordinary
+request carries `epoch + 1` and suppresses its cache declaration for one round.
+`HttpManageRequestClient` posts the manage hint with a placeholder body
+(`{"model": ..., "messages": [], "stream": false}`) and never treats the
+response as inference (protocol §8.3).
 
 ### 3.6 `cache_control`
 
@@ -175,6 +188,34 @@ per-field overrides supplied to the middleware win over measured values.
    requests carry the parent id + `derivation` with `join` explicit per §3.2.
 5. The header merge is additive: existing `extra_headers` set by upstream
    middleware are preserved; `X-Agent-Hint` is added/updated last.
+6. `session.state` is `start` or `append` only; `context_management` is never
+   part of an ordinary hint.
+
+### 4.6 Manage requests (lifecycle channel)
+
+When a `HttpManageRequestClient` is configured, the middleware emits:
+
+| verb | trigger in this harness | `call_index` |
+| --- | --- | --- |
+| `resume` | before the first ordinary request of an adopted/restored session (history already present), or after the composition called `send_manage("pause", ...)` | the upcoming call |
+| `compact` | after the middleware observes a committed prefix rewrite | the rewritten step (`call_index - 1`) |
+| `pause` | **no automatic trigger** — the composition calls `send_manage("pause", ...)` on a real "leaving/idle" signal | the most recent call |
+| `stop` | **no automatic trigger** — the composition calls `send_manage("stop", ...)` on destroy/archive | the most recent call |
+
+The automatic verbs are the ones this harness can observe at the request
+boundary. Turn completion is **not** a pause and task completion is **not** a
+stop (a conversational thread survives both), so those verbs stay explicit
+composition decisions. Without a manage client the middleware is L1: ordinary
+requests only.
+
+Transport rules (protocol §8.3/§8.4):
+
+- body is the placeholder `{"model": ..., "messages": [], "stream": false}`;
+- one `X-Agent-Hint` header carrying `session` + `context_management`;
+- per-session serialization; the next ordinary request waits on that lock;
+- only `resume` retries 408/429/5xx; a mutation with an unknown result isolates
+  the session and later ordinary requests fail with `ManageRequestError`;
+- `HTTP 2xx` means "accepted", not "KV action completed".
 
 ## 5. Out-of-band status events
 
@@ -214,10 +255,23 @@ serialized per-session `seq`; cross-process resume tolerance comes from
 
 ## 7. Revision notes
 
-- **2026-11-25 — four-block field contract.** `session.state` added (six-value
-  vocabulary; `stop` reserved for the event channel); root sessions now send
-  `parent_session_id: null`; `context_management` is always present;
-  `priority_control` mirrors `priority`; `cache_control` is a single object and
-  carries `msg_offset` (`= range.end`); `pin` is no longer emitted.
-  Consumers that read the array form must read the object form instead; the
-  embedded `range` keeps the previous locator.
+- **2026-11-25 — v1 alignment (three hard conflicts resolved).**
+  1. `context_management` is *manage-request only*: ordinary requests omit the
+     block entirely, `manage_request` is the JSON boolean `true`, and exactly
+     one edit is carried.
+  2. `session.state` on an ordinary request is only `start` / `append`;
+     lifecycle verbs (`pause` / `resume` / `stop` / `compact`) move to manage
+     requests.
+  3. Manage requests are separate HTTP requests with the fixed placeholder body
+     `{"model": …, "messages": [], "stream": false}` (`manage.py`).
+
+  A committed prefix rewrite is now expressed as `epoch + 1` plus one round of
+  cache suppression on the next ordinary request; the middleware additionally
+  sends the matching `compact` manage request (carrying the old epoch) when a
+  manage client is configured.
+- **2026-11-25 — four-block field contract.** `session.state` added;
+  root sessions now send `parent_session_id: null`; `priority_control` mirrors
+  `priority`; `cache_control` is a single object and carries `msg_offset`
+  (`= range.end`); `pin` is no longer emitted. Consumers that read the array
+  form must read the object form instead; the embedded `range` keeps the
+  previous locator.

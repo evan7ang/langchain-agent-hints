@@ -94,7 +94,6 @@ Requests then carry a header such as (base64url-decoded for readability):
   "session": {"session_id": "session-42", "parent_session_id": null,
               "agent_type": "my-agent", "call_index": 3, "epoch": 0,
               "state": "append"},
-  "context_management": {"manage_request": "false", "edits": []},
   "agent_status": {"state": "running", "state_since_ms": 1730000000000},
   "priority": {"level": 3, "reason": "user_waiting"},
   "priority_control": {"priority": {"level": 3, "reason": "user_waiting"}},
@@ -102,6 +101,13 @@ Requests then carry a header such as (base64url-decoded for readability):
                     "range": {"end": 2, "unit": "message"}}
 }
 ```
+
+Lifecycle verbs do **not** ride on ordinary requests. Pass a
+`HttpManageRequestClient` to emit separate manage requests (`session` +
+`context_management{manage_request: true, edits: [...]}` with a placeholder
+body); the middleware sends `resume` for adopted/restored sessions and
+`compact` after a rewrite, and compositions call `send_manage("pause"|"stop",
+...)` from their own leave/archive hooks.
 
 ### deepagents
 
@@ -129,8 +135,8 @@ gateway via `OPENAI_BASE_URL`.
 
 | Block | Content | Source |
 | --- | --- | --- |
-| `session` | `session_id`, `parent_session_id` (explicit `null` on roots), `agent_type`, `call_index`, `epoch`, `state`, optional `derivation` | `thread_id`, constructor options, persistent message history |
-| `context_management` | always present: `manage_request: "false"` and edits expanded from `session.state` (`pause → offload`, `resume → prefetch`, `compact → evict`, else empty) | `session.state` |
+| `session` | `session_id`, `parent_session_id` (explicit `null` on roots), `agent_type`, `call_index`, `epoch`, `state` (`start`/`append`), optional `derivation` | `thread_id`, constructor options, persistent message history |
+| `context_management` | **manage requests only**: `manage_request: true` + exactly one edit (`pause → offload`, `resume → prefetch`, `stop`/`compact → evict`); absent from every ordinary request | `build_manage_hint` via `HttpManageRequestClient` |
 | `agent_status` | wire snapshot: `running` by default, `pause` while parked (including a tool wait), `resume` on the first request after a release | middleware observation + shared `RunSignals` |
 | `priority` / `priority_control` | level + audit reason in both the legacy top-level block and the canonical `priority_control.priority`. Only `user_waiting` is 3; `critical_path`/`background` are 1. Auto: human message / approval resume → `3/user_waiting`; tool continuation/subagent → `1/critical_path`; `run_mode="batch"` → `1/background` | request trigger + shared `RunSignals`; explicit/service values normalized by reason |
 | `cache_control` | one `ephemeral` **object** with an explicit TTL (`clamp(gap*2, 60, 3600)`); `msg_offset` = `range.end` = logical input count (`[system?] + messages`) | per-request derivation from the cache-control guide (next-tool p90 → last interval → 300 s fallback; omitted below 128 tokens, on prefix rewrite, or on a model/tool-set change) |
@@ -144,11 +150,12 @@ Key emission rules:
 - No `thread_id` → no hint, no status events (identity is mandatory).
 - `call_index` is a session high-water counter seeded from the checkpointer-persisted message history
   (`1 + count(AIMessage)`); a compaction rewrite does not rewind it.
-- `epoch` bumps when the message prefix is rewritten (summarization signal).
-- `session.state` summarizes the request: `pause` while a tool/approval wait is open,
-  `compact` on the first request after a rewrite, `resume` on the released request,
-  `start` on a root session's first call, `append` otherwise. `stop` is reserved for
-  the out-of-band event channel (a finished turn has no closing request).
+- `epoch` bumps when the message prefix is rewritten (summarization signal); the
+  next ordinary request carries `epoch + 1` and suppresses `cache_control` for
+  that round.
+- `session.state` on an ordinary request is only `start` (a root session's first
+  call) or `append` (everything else). Lifecycle verbs (`pause` / `resume` /
+  `stop` / `compact`) are emitted as separate manage requests, never inlined.
 - Only requests flowing through `wrap_model_call` are hinted; auxiliary
   model calls that bypass the middleware chain are not. For an auxiliary call
   that does flow through the chain (e.g. a compaction summary), wrap it in
